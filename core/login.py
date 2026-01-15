@@ -1,0 +1,90 @@
+from playwright.sync_api import Page
+from common import goto_naver_main, goto_cafe_home, wait, Delay
+
+from typing import Literal
+
+
+class AuthenticateError(ValueError):
+    ...
+
+class WarningAccountError(AuthenticateError):
+    ...
+
+class ReCaptchaRequiredError(AuthenticateError):
+    ...
+
+
+def login(
+        page: Page,
+        userid: str,
+        passwd: str,
+        referer: Literal["main","cafe"] = "cafe",
+        mobile: bool = True,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (0.8, 2.2),
+    ):
+    wander_around(page, mobile, goto_delay)
+    login_begin(page, referer, mobile, action_delay, goto_delay)
+    login_action(page, userid, passwd, mobile, action_delay, goto_delay)
+
+    if page.locator("#divWarning").count() > 0:
+        raise WarningAccountError(f"[{userid}] 회원님의 아이디를 보호하고 있습니다.")
+    elif page.locator("#rcapt").count() > 0:
+        raise ReCaptchaRequiredError(f"[{userid}] 자동입력 방지 문자를 입력해주세요.")
+    else:
+        goto_cafe_home(page, mobile, action_delay, goto_delay)
+
+
+def wander_around(page: Page, mobile: bool = True, goto_delay: Delay = (0.8, 2.2)):
+    page.goto("https://www.google.com"), wait(goto_delay)
+    page.goto(f"https://{'m.' if mobile else 'www.'}naver.com"), wait(goto_delay)
+
+
+def login_begin(
+        page: Page,
+        referer: Literal["main","cafe"],
+        mobile: bool = True,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (0.8, 2.2),
+    ):
+    if referer == "cafe":
+        goto_cafe_home(page, mobile, action_delay, goto_delay)
+        if mobile:
+            page.tap('.login_wrap a[role="button"]'), wait(goto_delay)
+        else:
+            page.click(".login_area a.login"), wait(goto_delay)
+            # :has(a[href="https://cafe.naver.com"][target="_blank"])
+            # return context.pages[-1]
+    else:
+        goto_naver_main(page, mobile, goto_delay)
+        if mobile:
+            page.tap('#MM_logo [class$="profile"]'), wait(goto_delay)
+            page.tap('a[href^="https://nid.naver.com/nidlogin.login"]'), wait(goto_delay)
+        else:
+            page.click('#account a[href*="nidlogin"]'), wait(goto_delay)
+
+
+def login_action(
+        page: Page,
+        userid: str,
+        passwd: str,
+        mobile: bool = True,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (0.8, 2.2),
+    ):
+    def type_value(selector: str, value: str):
+        if mobile:
+            page.tap(selector), wait(action_delay)
+        else:
+            page.click(selector), wait(action_delay)
+        page.type(selector, value, delay=100), wait(action_delay)
+
+    type_value("input#id", userid)
+    type_value("input#pw", passwd)
+
+    if mobile:
+        page.tap("#submit_btn"), wait(goto_delay), wait(goto_delay)
+    else:
+        # if page.get_attribute("#smart_LEVEL", "value") == '1':
+        #     safe_click(page, "#switch", method="mouse", steps=steps), wait(action_delay) # IP보안
+        page.click('button[type="submit"]'), wait(goto_delay)
