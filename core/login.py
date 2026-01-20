@@ -1,7 +1,13 @@
-from playwright.sync_api import Page
-from common import goto_naver_main, goto_cafe_home, wait, Delay
+from __future__ import annotations
 
-from typing import Literal
+from playwright.sync_api import Page
+from core.home import goto_naver_main, goto_cafe_home
+from utils.common import wait, Delay
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Literal
 
 
 class AuthenticateError(ValueError):
@@ -21,7 +27,7 @@ def login(
         referer: Literal["main","cafe"] = "cafe",
         mobile: bool = True,
         action_delay: Delay = (0.3, 0.6),
-        goto_delay: Delay = (0.8, 2.2),
+        goto_delay: Delay = (1, 3),
     ):
     wander_around(page, mobile, goto_delay)
     login_begin(page, referer, mobile, action_delay, goto_delay)
@@ -35,7 +41,7 @@ def login(
         goto_cafe_home(page, mobile, action_delay, goto_delay)
 
 
-def wander_around(page: Page, mobile: bool = True, goto_delay: Delay = (0.8, 2.2)):
+def wander_around(page: Page, mobile: bool = True, goto_delay: Delay = (1, 3)):
     page.goto("https://www.google.com"), wait(goto_delay)
     page.goto(f"https://{'m.' if mobile else 'www.'}naver.com"), wait(goto_delay)
 
@@ -45,7 +51,7 @@ def login_begin(
         referer: Literal["main","cafe"],
         mobile: bool = True,
         action_delay: Delay = (0.3, 0.6),
-        goto_delay: Delay = (0.8, 2.2),
+        goto_delay: Delay = (1, 3),
     ):
     if referer == "cafe":
         goto_cafe_home(page, mobile, action_delay, goto_delay)
@@ -70,7 +76,7 @@ def login_action(
         passwd: str,
         mobile: bool = True,
         action_delay: Delay = (0.3, 0.6),
-        goto_delay: Delay = (0.8, 2.2),
+        goto_delay: Delay = (1, 3),
     ):
     def type_value(selector: str, value: str):
         if mobile:
@@ -86,5 +92,5 @@ def login_action(
         page.tap("#submit_btn"), wait(goto_delay), wait(goto_delay)
     else:
         # if page.get_attribute("#smart_LEVEL", "value") == '1':
-        #     safe_click(page, "#switch", method="mouse", steps=steps), wait(action_delay) # IP보안
+        #     safe_click(page, "#switch", position="center"), wait(action_delay) # IP보안
         page.click('button[type="submit"]'), wait(goto_delay)
