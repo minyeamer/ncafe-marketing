@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from playwright.sync_api import Page, Locator
+from core.agent import ArticleParams, ArticleContext
+from core.agent import select_articles, ChatModel, Prompts
+
 from utils.common import wait, Delay
 from utils.locator import Overlay, locate_all
 from utils.locator import is_visible, range_boundaries
@@ -14,16 +17,10 @@ import re
 
 if TYPE_CHECKING:
     from typing import Iterable, Set
+    from pathlib import Path
 
 MenuName = TypeVar("MenuName", bound=str)
 ArticleId = TypeVar("ArticleId", bound=str)
-
-class ArticleParams(TypedDict):
-    clubid: str
-    articleid: str
-    boardtype: str
-    menuid: str
-    title: str
 
 class CafeRanges(TypedDict):
     boundary: Locator
@@ -88,22 +85,42 @@ def _get_menu_overlay(page: Page) -> Overlay:
 
 
 ###################################################################
-##################### Action 3: :goto_article: ####################
+################### Action 3: :explore_articles: ##################
 ###################################################################
 
-def goto_article(page: Page, visited: Set[ArticleId] = set(), goto_delay: Delay = (1, 3)) -> ArticleParams | None:
-    random.shuffle(articles := locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True)))
-    for article in articles:
-        query = urlparse(article.get_attribute("href") or str()).query
-        params = dict([kv.split('=') for kv in query.split('&')])
-        if int(params["articleid"]) not in visited:
-            params["title"] = article.locator(".tit").first.text_content().strip()
-            article.tap(), wait(goto_delay)
-            visited.add(int(params["articleid"]))
-            return params
-    return None
+def explore_articles(
+        page: Page,
+        cafe_name: str,
+        menu_name: str,
+        visited: Set[ArticleId] = set(),
+        model: ChatModel | None = None,
+        prompts: str | Path | Prompts | None = None,
+        temperature: float | None = 0.1,
+        **kwargs
+    ) -> list[ArticleContext]:
+    articles = list_articles(page, visited)
+    if articles:
+        return select_articles(articles, cafe_name, menu_name, model, prompts, temperature, **kwargs)
+    else:
+        return list()
 
-################### Action 8: :navigate_article: ##################
+
+def list_articles(page: Page, visited: Set[ArticleId] = set()) -> list[ArticleParams]:
+    articles = list()
+    for article in locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True)):
+        params = _parse_params(article.get_attribute("href") or str())
+        if params["articleid"] not in visited:
+            visited.add(params["articleid"])
+            params["title"] = article.locator(".tit").first.text_content().strip()
+            articles.append(params)
+    return articles
+
+
+def _parse_params(href: str) -> dict[str,str]:
+    query = urlparse(href).query
+    return dict([kv.split('=') for kv in query.split('&')])
+
+################### Action 9: :navigate_article: ##################
 
 def next_articles(page: Page, action_delay: Delay = (0.3, 0.6)):
     ranges = get_cafe_ranges(page, header=True, tab=True)
@@ -117,7 +134,20 @@ def reload_articles(page: Page, goto_delay: Delay = (1, 3)):
 
 
 ###################################################################
-##################### Action 4: :read_article: ####################
+##################### Action 4: :goto_article: ####################
+###################################################################
+
+def goto_article(page: Page, article_id: str, goto_delay: Delay = (1, 3)) -> bool:
+    for article in locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True)):
+        params = _parse_params(article.get_attribute("href") or str())
+        if article_id == params["articleid"]:
+            article.tap(), wait(goto_delay)
+            return True
+    return False
+
+
+###################################################################
+##################### Action 5: :read_article: ####################
 ###################################################################
 
 def read_article(page: Page, wait_until_read: bool = True) -> list[str]:
@@ -173,14 +203,14 @@ def _count_hangul_chars(text) -> int:
 def _count_english_chars(text) -> int:
     return len(re.sub(r"[^a-zA-Z0-9]", '', text))
 
-##################### Action 7: :like_article: ####################
+##################### Action 8: :like_article: ####################
 
 def like_article(page: Page):
     like_button = page.locator('.right_area [data-type="like"]').first
     if like_button.get_attribute("aria-pressed") == "false":
         like_button.tap()
 
-################### Action 8: :navigate_article: ##################
+################### Action 9: :navigate_article: ##################
 
 def next_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
     ranges = get_cafe_ranges(page, header=True, tab=False)
@@ -201,7 +231,7 @@ def go_back(page: Page, goto_delay: Delay = (1, 3)):
 
 
 ###################################################################
-#################### Action 5: :write_comment: ####################
+#################### Action 6: :write_comment: ####################
 ###################################################################
 
 def write_comment(page: Page, comment: str, action_delay: Delay = (0.3, 0.6), goto_delay: Delay = (1, 3)):
@@ -212,7 +242,7 @@ def write_comment(page: Page, comment: str, action_delay: Delay = (0.3, 0.6), go
 
 
 ###################################################################
-#################### Action 6: :write_article: ####################
+#################### Action 7: :write_article: ####################
 ###################################################################
 
 def write_article(page: Page):
