@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from playwright.sync_api import Page, Locator
+from utils.common import wait, Delay
 from utils.locator import LocatorFilters, locate
 from utils.locator import Position, Offset, pos
 from utils.mouse import Overlay, safe_wheel
@@ -29,6 +30,8 @@ def safe_tap(
         position: Position | Offset | None = None,
         boundary: Locator | Literal["viewport"] | None = None,
         overlay: Overlay | None = None,
+        threshold: float = 0.5,
+        delay: Delay = (0.3, 0.6),
         **kwargs
     ) -> Locator | None:
     ...
@@ -42,6 +45,8 @@ def safe_tap(
         position: Position | Offset | None = None,
         boundary: Locator | Literal["viewport"] | None = None,
         overlay: Overlay | None = None,
+        threshold: float = 0.5,
+        delay: Delay = (0.3, 0.6),
         **kwargs
     ) -> Locator | None:
     ...
@@ -55,6 +60,7 @@ def safe_tap(
         boundary: Locator | Literal["viewport"] | None = None,
         overlay: Overlay | None = None,
         threshold: float = 0.5,
+        delay: Delay = (0.3, 0.6),
         **kwargs
     ) -> Locator | None:
     element = locate(page, selector, nth, **filters) if selector else page
@@ -64,6 +70,7 @@ def safe_tap(
             safe_wheel(page, element, boundary, overlay, threshold)
         else:
             element.evaluate(JS["scrollIntoView()"])
+        wait(delay)
 
         position = dict(position=position) if isinstance(position, str) else position
         x, y = pos(element, **position) if isinstance(position, dict) else None, None

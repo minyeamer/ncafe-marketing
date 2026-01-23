@@ -110,6 +110,9 @@ def is_visible(
         threshold: float = 0.5,
     ) -> bool:
     el_box = element.bounding_box()
+    if not el_box:
+        return False
+
     y, height = el_box['y'], el_box["height"]
     if (y <= min_y) and (max_y <= (y + height)):
         return True
