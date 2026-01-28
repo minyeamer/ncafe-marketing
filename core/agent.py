@@ -4,6 +4,7 @@ import openai
 
 from typing import TypeVar, TypedDict, TYPE_CHECKING
 from pathlib import Path
+import datetime as dt
 import json
 import os
 import random
@@ -14,6 +15,10 @@ if TYPE_CHECKING:
 
 ChatModel = TypeVar("ChatModel", bound=str)
 
+class Prompt(TypedDict):
+    role: str
+    content: str
+
 class ArticleParams(TypedDict):
     clubid: str
     articleid: str
@@ -21,16 +26,18 @@ class ArticleParams(TypedDict):
     menuid: str
     title: str
 
-class ArticleData(TypedDict):
+class ArticleInfo(TypedDict):
     title: str
-    created_at: str
     contents: list[str]
     comments: list[str]
+    created_at: str
 
-class Prompt(TypedDict, total=False):
-    system: str
-    user: str
-    assistant: str | None
+class NewArticle(TypedDict):
+    title: str
+    contents: list[str]
+    type: int
+    emotion: int
+    created_at: str
 
 
 KEY_PATH = "env/api.key"
@@ -68,44 +75,36 @@ def read_prompt(cafe_name: str, menu_name: str, agent_name: str, root: str = "en
 
 def chat(
         model: ChatModel,
-        system: str,
-        user: str,
-        assistant: str | None = None,
+        messages: list[str],
         verbose: bool = False,
         **kwargs
     ) -> str:
     start_time = time.perf_counter()
-    response = openai.chat.completions.create(
-        model = model,
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            *([{"role": "assistant", "content": assistant}] if assistant else []),
-        ],
-        **kwargs
-    )
+    response = openai.chat.completions.create(model=model, messages=messages, **kwargs)
     content = response.choices[0].message.content
     if verbose:
-        print(f"[질문하기] {round(time.perf_counter() - start_time, 1)}초 대기")
-        print(content)
-        print(f"[답변완료] 입력 토큰: {response.usage.prompt_tokens}, 출력 토큰: {response.usage.completion_tokens}")
+        print(f"[추론 시간] {round(time.perf_counter() - start_time, 1)}초 대기")
+        print(f"[응답 결과] {content}")
+        print(f"[사용 토큰] 입력: {response.usage.prompt_tokens}, 출력: {response.usage.completion_tokens}")
     return content
 
 
 def chat_json(
         model: str,
-        system: str,
-        user: str,
-        assistant: str | None = None,
+        messages: list[str],
         verbose: bool = False,
         **kwargs
     ) -> dict | list:
-    content = chat(model, system, user, assistant, verbose, **kwargs)
+    content = chat(model, messages, verbose, **kwargs)
     try:
         return json.loads(content)
     except json.JSONDecodeError as error:
-        print("JSON 파싱할 수 없습니다: ", content.replace('\n', ' '))
+        print("[JSONDecodeError] JSON 파싱할 수 없습니다: ", content.replace('\n', ' '))
         raise error
+
+
+def min_json(data: dict | list) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(',', ':'), default=str)
 
 
 ###################################################################
@@ -117,7 +116,7 @@ def select_articles(
         menu_name: str,
         articles: Iterable[ArticleParams],
         model: ChatModel | None = None,
-        prompt: str | Path | Prompt | None = None,
+        messages: str | Path | list[Prompt] | None = None,
         temperature: float | None = 0.1,
         verbose: bool = False,
         **kwargs
@@ -125,33 +124,36 @@ def select_articles(
     """
     ### MARKDOWN FORMAT
     ```
-    '${model}\\n---\\n${system-content}\\n---\\n${hint1}\\n---\\n${hint2}'
+    '${model}\\n<--->\\n${system-content}\\n<--->\\n${user-content}\\n${assistant-content}'
     ```
     ### INPUT FORMAT
     ```
-    {
-        "articles": [
-            {"articleid": "131", "title": "제목1"},
-            {"articleid": "242", "title": "제목2"},
-            {"articleid": "353", "title": "제목3"}
-        ],
-        "hints": ["사례1", "사례2"]
-    }
+    [
+        {"articleid": "131", "title": "제목1"},
+        {"articleid": "242", "title": "제목2"},
+        {"articleid": "353", "title": "제목3"}
+    ]
     ```
     ### OUTPUT FORMAT
     ```
-    '131,353'
+    ["131","242"]
     ```
     """
-    if not isinstance(prompt, dict):
-        model, prompt = _build_select_articles_prompt(cafe_name, menu_name, articles, model, prompt)
+    if not isinstance(messages, list):
+        model, messages = _build_select_articles_prompt(cafe_name, menu_name, articles, model, messages)
+    if verbose:
+        print("[사용자 입력] {}".format(messages[-1]["content"]))
 
     if isinstance(temperature, (float,int)):
         kwargs["temperature"] = temperature
 
-    answer = chat(model or "gpt-4o-mini", **prompt, verbose=verbose, **kwargs)
-    article_ids = answer.split(',')
-    return [article for article in articles if article["articleid"] in article_ids]
+    try:
+        article_ids = set(chat_json(model or "gpt-4o-mini", messages, verbose=verbose, **kwargs))
+        return [article for article in articles if article["articleid"] in article_ids]
+    except Exception as e:
+        if verbose:
+            print(f"[{type(e)}] {e}")
+    return str()
 
 
 def _build_select_articles_prompt(
@@ -160,17 +162,28 @@ def _build_select_articles_prompt(
         articles: Iterable[ArticleParams],
         model: ChatModel | None = None,
         markdown_path: str | Path | None = None,
-    ) -> tuple[ChatModel, Prompt]:
+    ) -> tuple[ChatModel, list[Prompt]]:
     markdown = read_file(markdown_path) if markdown_path else read_prompt(cafe_name, menu_name, "select_articles")
-    sections = markdown.split("\n---\n")
-
+    sections = markdown.split("\n<--->\n")
     model = model if model else sections[0]
-    system = sections[1].replace("${cafe_name}", cafe_name).replace("${menu_name}", menu_name)
-    user = {"articles": [{"articleid": p["articleid"], "title": p["title"]} for p in articles], "hints": []}
-    if len(sections) > 2:
-        user["hints"] = sections[2:]
+    messages = [{"role": "system", "content": sections[1]}]
 
-    return model, dict(system=system, user=json.dumps(user, ensure_ascii=False, separators=(',', ':')))
+    for section in sections[2:]:
+        try:
+            user, assistant = section.split('\n')
+        except ValueError:
+            continue
+        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
+
+    articles = [{"articleid": article["articleid"], "title": article["title"]}
+                for article in articles if not is_question(article["title"])]
+    messages.append({"role": "user", "content": min_json(articles)})
+
+    return model, messages
+
+
+def is_question(title: str) -> bool:
+    return title.endswith('?') or ("추천" in title)
 
 
 ###################################################################
@@ -180,58 +193,161 @@ def _build_select_articles_prompt(
 def create_comment(
         cafe_name: str,
         menu_name: str,
-        article_data: ArticleData,
+        article_info: ArticleInfo,
         model: ChatModel | None = None,
-        prompt: str | Path | Prompt | None = None,
-        reasoning_effort: Literal["minimal","low","medium","high"] | None = "medium",
+        messages: str | Path | list[Prompt] | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
         verbose: bool = False,
         **kwargs
     ) -> str:
     """
     ### MARKDOWN FORMAT
     ```
-    '${model}\\n---\\n${system-content}\\n---\\n${hint1}\\n---\\n${hint2}'
+    '${model}\\n<--->\\n${system-content}\\n<--->\\n${user-content}\\n${assistant-content}'
     ```
     ### INPUT FORMAT
     ```
     {
         "title": "제목",
-        "contents": ["문장1", "이미지주소1", "문장2"],
-        "comments": ["댓글1", "댓글2", "댓글3"],
-        "created_time": "2026-01-02T12:04:05+09:00",
-        "current_time": "2026-01-02T12:04:05+09:00",
-        "hints": ["사례1", "사례2"]
+        "contents": ["문장1", "![alt](url)", "문장2"],
+        "comments": ["댓글1", "댓글2"],
+        "created_at": "2026-01-02T12:04:05+09:00",
+        "current_time": "2026-01-02T12:04:05+09:00"
     }
     ```
     ### OUTPUT FORMAT
     ```
-    '댓글4'
+    {"comment":null,"reject_reason":null,"violation_reason":null}
     ```
     """
-    if not isinstance(prompt, dict):
-        model, prompt = _build_create_comment_prompt(cafe_name, menu_name, article_data, model, prompt)
+    if not isinstance(messages, list):
+        model, messages = _build_create_comment_prompt(cafe_name, menu_name, article_info.copy(), model, messages)
+    if verbose:
+        print("[사용자 입력] {}".format(messages[-1]["content"]))
 
     if isinstance(reasoning_effort, str):
         kwargs["reasoning_effort"] = reasoning_effort
 
-    return chat(model or "gpt-5-mini", **prompt, verbose=verbose, **kwargs)
+    try:
+        comment = chat_json(model or "gpt-5-mini", messages, verbose=verbose, **kwargs)
+        if comment.get("comment") and not (comment.get("reject_reason") or comment.get("violation_reason")):
+            return comment["comment"]
+    except Exception as e:
+        if verbose:
+            print(f"[{type(e)}] {e}")
+    return str()
 
 
 def _build_create_comment_prompt(
         cafe_name: str,
         menu_name: str,
-        article_data: ArticleData,
+        article_info: ArticleInfo,
+        model: ChatModel | None = None,
+        markdown_path: str | Path | None = None,
+    ) -> tuple[ChatModel, list[Prompt]]:
+    markdown = read_file(markdown_path) if markdown_path else read_prompt(cafe_name, menu_name, "create_comment")
+    sections = markdown.split("\n<--->\n")
+    model = model if model else sections[0]
+    messages = [{"role": "system", "content": sections[1]}]
+
+    for section in sections[2:]:
+        try:
+            user, assistant = section.split('\n')
+        except ValueError:
+            continue
+        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
+
+    article_info["current_time"] = (dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00")
+    messages.append({"role": "user", "content": min_json(article_info)})
+
+    return model, messages
+
+
+###################################################################
+#################### Agent 3: :create_article: ####################
+###################################################################
+
+def create_article(
+        cafe_name: str,
+        menu_name: str,
+        articles: Iterable[ArticleInfo],
+        history: Iterable[str] = list(),
+        model: ChatModel | None = None,
+        messages: str | Path | list[Prompt] | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        verbose: bool = False,
+        **kwargs
+    ) -> NewArticle:
+    """
+    ### MARKDOWN FORMAT
+    ```
+    '${model}\\n<--->\\n${system-content}\\n<--->\\n${user-content}\\n${assistant-content}'
+    ```
+    ### INPUT FORMAT
+    ```
+    {
+        "articles": [{
+            "title": "제목",
+            "contents": ["문장1", "![alt](url)", "문장2"],
+            "comments": ["댓글1", "댓글2"],
+            "created_at": "2026-01-02T12:04:05+09:00"
+        }],
+        "history": [{
+            "title": "제목",
+            "contents": ["문장1", "![alt](url)", "문장2"],
+            "comments": ["댓글1", "댓글2"],
+            "created_at": "2026-01-02T12:04:05+09:00"
+        }],
+        "current_time": "2026-01-02T12:04:05+09:00"
+    }
+    ```
+    ### OUTPUT FORMAT
+    ```
+    {"title":"제목","contents":["문장1","문장2"],"type":null,"emotion":null,"violation_reason":null}
+    ```
+    """
+    if not isinstance(messages, list):
+        model, messages = _build_create_article_prompt(cafe_name, menu_name, articles, history, model, messages)
+
+    if isinstance(reasoning_effort, str):
+        kwargs["reasoning_effort"] = reasoning_effort
+
+    try:
+        article = chat_json(model or "gpt-5-mini", messages, verbose=verbose, **kwargs)
+        if not article.get("violation_reason"):
+            article["created_at"] = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
+            return article
+    except Exception as e:
+        if verbose:
+            print(f"[{type(e)}] {e}")
+    return dict()
+
+
+def _build_create_article_prompt(
+        cafe_name: str,
+        menu_name: str,
+        articles: Iterable[ArticleInfo],
+        history: Iterable[str] = list(),
         model: ChatModel | None = None,
         markdown_path: str | Path | None = None,
     ) -> tuple[ChatModel, Prompt]:
-    markdown = read_file(markdown_path) if markdown_path else read_prompt(cafe_name, menu_name, "create_comment")
-    sections = markdown.split("\n---\n")
-
+    markdown = read_file(markdown_path) if markdown_path else read_prompt(cafe_name, menu_name, "create_article")
+    sections = markdown.split("\n<--->\n")
     model = model if model else sections[0]
-    system = sections[1].replace("${cafe_name}", cafe_name).replace("${menu_name}", menu_name)
-    if len(sections) > 2:
-        article_data["hints"] = sections[2:]
-    else:
-        article_data["hints"] = list()
+    messages = [{"role": "system", "content": sections[1]}]
 
-    return model, dict(system=system, user=json.dumps(article_data, ensure_ascii=False, separators=(',', ':')))
+    for section in sections[2:]:
+        try:
+            user, assistant = section.split('\n')
+        except ValueError:
+            continue
+        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
+
+    data = {
+        "articles": list(articles),
+        "history": history,
+        "current_time": (dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00")
+    }
+    messages.append({"role": "user", "content": min_json(data)})
+
+    return model, messages

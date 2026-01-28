@@ -4,7 +4,8 @@ from playwright.sync_api import Page, Locator
 
 from core.agent import ChatModel, Prompt
 from core.agent import ArticleParams, select_articles
-from core.agent import ArticleData, create_comment
+from core.agent import ArticleInfo, create_comment
+from core.agent import NewArticle, create_article
 
 from utils.common import wait, Delay
 from utils.locator import Overlay, locate_all
@@ -34,10 +35,36 @@ class CafeRanges(TypedDict):
 class Contents(TypedDict):
     lines: list[str]
     visible_lines: list[str]
-    total: int
+    total_lines: int
     read_start: int
     read_end: int
     read_done: bool
+
+
+def cur_time() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
+
+
+def _to_iso_date(text: str) -> str:
+    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\.)", text)):
+        try:
+            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d.")
+            return datetime.strftime("%Y-%m-%d") + "T00:00:00+09:00"
+        except:
+            return cur_time()
+    else:
+        return cur_time()
+
+
+def _to_iso_datetime(text: str) -> str:
+    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\. \d{2}:\d{2})", text)):
+        try:
+            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d. %H:%M")
+            return datetime.strftime("%Y-%m-%dT%H:%M") + ":00+09:00"
+        except:
+            return cur_time()
+    else:
+        return cur_time()
 
 
 ###################################################################
@@ -51,6 +78,10 @@ def goto_cafe(
     ):
     page.tap(f'.mycafe_flicking:not([style="display: none;"]) a:has-text("{cafe_name}")')
     wait(goto_delay)
+
+
+def go_back(page: Page, goto_delay: Delay = (1, 3)):
+    page.go_back(), wait(goto_delay)
 
 
 def get_cafe_ranges(page: Page, header: bool = True, tab: bool = False) -> CafeRanges:
@@ -108,14 +139,14 @@ def explore_articles(
         menu_name: str,
         visited: Set[ArticleId] = set(),
         model: ChatModel | None = None,
-        prompt: str | Path | Prompt | None = None,
+        messages: str | Path | list[Prompt] | None = None,
         temperature: float | None = 0.1,
         verbose: bool = False,
         **kwargs
     ) -> list[ArticleParams]:
     articles = list_articles(page, visited)
     if articles:
-        return select_articles(cafe_name, menu_name, articles, model, prompt, temperature, verbose, **kwargs)
+        return select_articles(cafe_name, menu_name, articles, model, messages, temperature, verbose, **kwargs)
     else:
         return list()
 
@@ -135,7 +166,6 @@ def _parse_params(href: str) -> dict[str,str]:
     query = urlparse(href).query
     return dict([kv.split('=') for kv in query.split('&')])
 
-################## Action 9 - :navigate_article: ##################
 
 def next_articles(page: Page, action_delay: Delay = (0.3, 0.6)):
     ranges = get_cafe_ranges(page, header=True, tab=True)
@@ -172,15 +202,20 @@ def goto_article(page: Page, id: str | int | Literal["random"], goto_delay: Dela
 #################### Action 5 - :read_article: ####################
 ###################################################################
 
-def read_article(page: Page, wait_until_read: bool = True, verbose: bool = False) -> Contents:
+def read_article(
+        page: Page,
+        wait_until_read: bool = True,
+        verbose: bool = False,
+        contents_only: bool = False,
+    ) -> ArticleInfo | Contents:
     lines, visible_lines = list(), list()
-    isin_viewport, read_start, read_end, total = False, 0, 0, 0
+    isin_viewport, read_start, read_end = False, 0, 0
     _, min_y, _, max_y = range_boundaries(page, **get_cafe_ranges(page, header=True, tab=False))
 
     selector = lambda tag: f'#postContent {tag}:not([style="display: none;"]):not(.se-module-oglink *)'
     for i, el in enumerate(locate_all(page, ", ".join([selector('p'), selector("img")]))):
-        tag_name = el.evaluate("el => el.tagName")
-        if tag_name == "img":
+        tag_name = str(el.evaluate("el => el.tagName")).upper()
+        if tag_name == "IMG":
             line = f"![{el.get_attribute('alt') or '이미지'}]({el.get_attribute('src')})"
         else:
             line = el.text_content().replace('\u200b', '').strip()
@@ -194,8 +229,11 @@ def read_article(page: Page, wait_until_read: bool = True, verbose: bool = False
         elif isin_viewport:
             isin_viewport = False
             read_end = i
-        total += 1
-    read_done = ((read_end + 1) == total) if (total > 0) and visible_lines else True
+
+    total_lines = len(lines)
+    if isin_viewport and total_lines:
+        read_end = total_lines - 1
+    read_done = ((read_end + 1) == total_lines) if (total_lines > 0) and visible_lines else True
 
     seconds = round(_estimate_reading_seconds(visible_lines), 1)
     if verbose:
@@ -203,27 +241,58 @@ def read_article(page: Page, wait_until_read: bool = True, verbose: bool = False
     if wait_until_read:
         wait(seconds)
 
-    read_progress = dict(read_start=read_start, read_end=read_end, read_done=read_done)
-    return dict(lines=lines, visible_lines=visible_lines, total=total, **read_progress)
+    if contents_only:
+        keys = ["lines", "visible_lines", "total_lines", "read_start", "read_end", "read_done"]
+        values = [lines, visible_lines, total_lines, read_start, read_end, read_done]
+        return dict(zip(keys, values))
+    else:
+        return _make_article_info(page, lines)
 
 
 def read_full_article(
         page: Page,
+        action_delay: Delay = (0.3, 0.6),
         wait_until_read: bool = True,
         verbose: bool = False,
-        action_delay: Delay = (0.3, 0.6),
+        contents_only: bool = False,
         timeout: float = 30.,
-    ) -> Contents:
+    ) -> ArticleInfo | Contents:
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
-    contents = read_article(page, wait_until_read, verbose)
+    contents = read_article(page, wait_until_read, verbose, contents_only=True)
     read_start = contents["read_start"]
 
     while (not contents["read_done"]) and ((end_time() - start_time) < timeout):
         next_lines(page, action_delay)
-        contents = read_article(page, wait_until_read, verbose)
+        contents = read_article(page, wait_until_read, verbose, contents_only=True)
 
-    contents["read_start"] = read_start
-    return contents
+    if contents_only:
+        contents["read_start"] = read_start
+        return contents
+    else:
+        return _make_article_info(page, contents["lines"])
+
+
+def _make_article_info(page: Page, lines: list[str]) -> ArticleInfo:
+    return {
+        "title": page.locator(".post_title .tit").first.text_content().strip(),
+        "contents": lines,
+        "comments": read_comments(page),
+        "created_at": _to_iso_datetime(page.locator(".post_title .date").first.text_content().strip()),
+    }
+
+
+def next_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
+    ranges = get_cafe_ranges(page, header=True, tab=False)
+    delta = page.viewport_size["height"] - ranges["overlay"]["top"]
+    safe_wheel(page, delta=delta, **ranges)
+    wait(action_delay)
+
+
+def prev_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
+    ranges = get_cafe_ranges(page, header=True, tab=False)
+    delta = page.viewport_size["height"] - ranges["overlay"]["top"]
+    safe_wheel(page, delta=(delta * -1), **ranges)
+    wait(action_delay)
 
 
 def _estimate_reading_seconds(lines: Iterable[str], kor_cpm: int = 160, eng_cpm: int = 238) -> float:
@@ -255,35 +324,19 @@ def _count_hangul_chars(text) -> int:
 def _count_english_chars(text) -> int:
     return len(re.sub(r"[^a-zA-Z0-9]", '', text))
 
-#################### Action 8 - :like_article: ####################
 
-def like_article(page: Page):
+###################################################################
+#################### Action 6 - :like_article: ####################
+###################################################################
+
+def like_article(page: Page, action_delay: Delay = (0.3, 0.6)):
     like_button = page.locator('.right_area [data-type="like"]').first
     if like_button.get_attribute("aria-pressed") == "false":
-        like_button.tap()
-
-################## Action 9 - :navigate_article: ##################
-
-def next_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
-    ranges = get_cafe_ranges(page, header=True, tab=False)
-    delta = page.viewport_size["height"] - ranges["overlay"]["top"]
-    safe_wheel(page, delta=delta, **ranges)
-    wait(action_delay)
-
-
-def prev_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
-    ranges = get_cafe_ranges(page, header=True, tab=False)
-    delta = page.viewport_size["height"] - ranges["overlay"]["top"]
-    safe_wheel(page, delta=(delta * -1), **ranges)
-    wait(action_delay)
-
-
-def go_back(page: Page, goto_delay: Delay = (1, 3)):
-    page.go_back(), wait(goto_delay)
+        like_button.tap(), wait(action_delay)
 
 
 ###################################################################
-#################### Action 6 - :write_comment: ###################
+#################### Action 7 - :write_comment: ###################
 ###################################################################
 
 def write_comment(
@@ -313,7 +366,7 @@ def read_comments(page: Page) -> list[str]:
 
 
 ###################################################################
-########## Action 5+6 - :read_article_and_write_comment: ##########
+########## Action 5+7 - :read_article_and_write_comment: ##########
 ###################################################################
 
 def read_article_and_write_comment(
@@ -325,23 +378,17 @@ def read_article_and_write_comment(
         upload_delay: Delay = (2, 4),
         wait_until_read: bool = True,
         model: ChatModel | None = None,
-        prompt: str | Path | Prompt | None = None,
-        reasoning_effort: Literal["minimal","low","medium","high"] | None = "medium",
+        messages: str | Path | list[Prompt] | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
         verbose: bool = False,
         dry_run: bool = False,
         timeout: float = 30.,
         **kwargs
-    ) -> tuple[ArticleData, Comment]:
+    ) -> tuple[ArticleInfo, Comment]:
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
-    contents = read_article(page, wait_until_read=False, verbose=verbose)
-    article_data = {
-        "title": page.locator(".post_title .tit").first.text_content().strip(),
-        "contents": contents["lines"],
-        "comments": read_comments(page),
-        "created_time": _to_iso_datetime(page.locator(".post_title .date").first.text_content().strip()),
-        "current_time": dt.datetime.now().strftime("%Y-%m-%dT%H:%M") + "+09:00",
-    }
-    comment = create_comment(cafe_name, menu_name, article_data, model, prompt, reasoning_effort, verbose, **kwargs)
+    contents = read_article(page, wait_until_read=False, verbose=verbose, contents_only=True)
+    article_info = _make_article_info(page, contents["lines"])
+    comment = create_comment(cafe_name, menu_name, article_info, model, messages, reasoning_effort, verbose, **kwargs)
 
     if wait_until_read:
         current_wait = round(_estimate_reading_seconds(contents["visible_lines"]), 1)
@@ -356,23 +403,93 @@ def read_article_and_write_comment(
 
     if comment:
         write_comment(page, comment, action_delay, goto_delay, upload_delay, dry_run)
-    return article_data, comment
-
-
-def _to_iso_datetime(text: str) -> str:
-    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\. \d{2}:\d{2})", text)):
-        try:
-            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d. %H:%M")
-            return datetime.strftime("%Y-%m-%dT%H:%M") + "+09:00"
-        except:
-            return dt.datetime.now().strftime("%Y-%m-%dT%H:%M") + "+09:00"
-    else:
-        return dt.datetime.now().strftime("%Y-%m-%dT%H:%M") + "+09:00"
+    return article_info, comment
 
 
 ###################################################################
-#################### Action 7 - :write_article: ###################
+#################### Action 8 - :write_article: ###################
 ###################################################################
 
-def write_article(page: Page):
-    ...
+def write_article(
+        page: Page,
+        cafe_name: str,
+        menu_name: str,
+        articles: Iterable[ArticleInfo],
+        history: Iterable[str] = list(),
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        upload_delay: Delay = (2, 4),
+        model: ChatModel | None = None,
+        messages: str | Path | list[Prompt] | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        verbose: bool = False,
+        dry_run: bool = False,
+        **kwargs
+    ) -> NewArticle:
+    page.locator(".FloatingWriteButton > button").first.tap(), wait(goto_delay)
+    article = create_article(cafe_name, menu_name, articles, history, model, messages, reasoning_effort, verbose, **kwargs)
+
+    title_area = page.locator(".ArticleWriteFormSubject textarea").first
+    title_area.tap(), wait(action_delay)
+    title_area.type(article["title"], delay=100), wait(action_delay)
+
+    content_area = page.locator("#one-editor article").first
+    content_area.tap(), wait(action_delay)
+    for line_no, content in enumerate(article["contents"]):
+        if line_no > 0:
+            page.keyboard.press("Enter"), wait(action_delay)
+        if content:
+            content_area.type(content, delay=100), wait(action_delay)
+
+    if not dry_run:
+        safe_tap(page, '.ArticleWriteComplete > [role="button"]', filters=dict(has_text="등록")), wait(upload_delay)
+
+    return article
+
+
+###################################################################
+#################### Action 9 - :read_history: ####################
+###################################################################
+
+def read_history(
+        page: Page,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        n_articles: int | None = 10,
+        read_articles: bool = True,
+        wait_until_read: bool = True,
+        verbose: bool = False,
+    ) -> list[ArticleInfo]:
+    page.tap(f'header button:has-text("메뉴")'), wait(action_delay)
+    page.tap("header .info_link"), wait(goto_delay)
+
+    data = list()
+    try:
+        for item in locate_all(page, ".list_area .txt_area")[:n_articles]:
+            if read_articles:
+                safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
+                try:
+                    data.append(read_article(page, wait_until_read, verbose, contents_only=False))
+                finally:
+                    go_back(page, goto_delay)
+            else:
+                data.append({
+                    "title": item.locator(".tit").text_content().strip(),
+                    "contents": list(),
+                    "comments": list(),
+                    "created_at": _to_iso_date(item.locator(".time").text_content().strip()),
+                })
+        return data
+    finally:
+        page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
+
+
+def _get_info_ranges(page: Page) -> CafeRanges:
+    return dict(
+        boundary = page.locator("body").first,
+        overlay = _get_info_overlay(page),
+    )
+
+
+def _get_info_overlay(page: Page) -> Overlay:
+    return dict(top = page.locator(".HeaderWrap").first.bounding_box()["height"])
