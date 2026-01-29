@@ -233,3 +233,7 @@ __marimo__/
 debug*.ipynb
 debug*.py
 debug*.sh
+
+# User defined
+.prompts/
+.secrets/

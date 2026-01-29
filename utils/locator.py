@@ -69,7 +69,8 @@ def locate(
     locator = page.locator(selector, **kwargs)
     if (element := locator.first):
         if boundary is not None:
-            visible = [element for element in locator.all() if is_visible(page, element, boundary, overlay, threshold)]
+            _, min_y, _, max_y = range_boundaries(page, boundary, overlay)
+            visible = [element for element in locator.all() if is_visible(element, min_y, max_y, threshold)]
             return random.choice(visible) if nth == "random" else visible[nth]
         elif isinstance(nth, int):
             return locator.all()[nth] if nth > 0 else element
