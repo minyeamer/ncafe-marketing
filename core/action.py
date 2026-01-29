@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, Locator
 
-from core.agent import ChatModel, Prompt
+from core.agent import Prompt4, Prompt5
 from core.agent import ArticleParams, select_articles
 from core.agent import ArticleInfo, create_comment
 from core.agent import NewArticle, create_article
 
-from utils.common import wait, Delay
+from utils.common import print_json, wait, Delay
 from utils.locator import Overlay, locate_all
 from utils.locator import is_visible, range_boundaries
 from utils.mouse import safe_wheel
@@ -22,7 +22,6 @@ import time
 
 if TYPE_CHECKING:
     from typing import Iterable, Literal, Set
-    from pathlib import Path
 
 MenuName = TypeVar("MenuName", bound=str)
 ArticleId = TypeVar("ArticleId", bound=str)
@@ -76,6 +75,7 @@ def goto_cafe(
         cafe_name: str,
         goto_delay: Delay = (1, 3),
     ):
+    """## Action 1"""
     page.tap(f'.mycafe_flicking:not([style="display: none;"]) a:has-text("{cafe_name}")')
     wait(goto_delay)
 
@@ -109,7 +109,8 @@ def goto_menu(
         has_text: Iterable[str] = list(),
         has_not_text: Iterable[str] = list(),
     ) -> MenuName:
-    page.tap(f'header button:has-text("메뉴")'), wait(action_delay)
+    """## Action 2"""
+    open_menu(page, action_delay)
     if menu_name:
         safe_tap(page, f'a:has-text("{menu_name}")', delay=action_delay), wait(goto_delay)
         return menu_name
@@ -119,6 +120,10 @@ def goto_menu(
         filters = dict(has_text=has_text, has_not_text=has_not_text)
         a = safe_tap(page, "a.link_menu", nth="random", filters=filters, delay=action_delay)
         return a.locator(".menu").text_content()
+
+
+def open_menu(page: Page, action_delay: Delay = (0.3, 0.6)):
+    page.tap(f'header button:has-text("메뉴")'), wait(action_delay)
 
 
 def _get_menu_boundary(page: Page) -> Locator:
@@ -135,18 +140,15 @@ def _get_menu_overlay(page: Page) -> Overlay:
 
 def explore_articles(
         page: Page,
-        cafe_name: str,
-        menu_name: str,
         visited: Set[ArticleId] = set(),
-        model: ChatModel | None = None,
-        messages: str | Path | list[Prompt] | None = None,
-        temperature: float | None = 0.1,
-        verbose: bool = False,
+        prompt: Prompt4 = dict(),
+        verbose: int = 0,
         **kwargs
     ) -> list[ArticleParams]:
+    """## Action 3"""
     articles = list_articles(page, visited)
     if articles:
-        return select_articles(cafe_name, menu_name, articles, model, messages, temperature, verbose, **kwargs)
+        return select_articles(articles, **prompt, verbose=verbose, **kwargs)
     else:
         return list()
 
@@ -183,6 +185,7 @@ def reload_articles(page: Page, goto_delay: Delay = (1, 3)):
 ###################################################################
 
 def goto_article(page: Page, id: str | int | Literal["random"], goto_delay: Delay = (1, 3)) -> bool:
+    """## Action 4"""
     articles = locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True))
     if isinstance(id, int):
         articles[id].tap(), wait(goto_delay)
@@ -205,9 +208,10 @@ def goto_article(page: Page, id: str | int | Literal["random"], goto_delay: Dela
 def read_article(
         page: Page,
         wait_until_read: bool = True,
-        verbose: bool = False,
+        verbose: int = 0,
         contents_only: bool = False,
     ) -> ArticleInfo | Contents:
+    """## Action 5"""
     lines, visible_lines = list(), list()
     isin_viewport, read_start, read_end = False, 0, 0
     _, min_y, _, max_y = range_boundaries(page, **get_cafe_ranges(page, header=True, tab=False))
@@ -236,10 +240,9 @@ def read_article(
     read_done = ((read_end + 1) == total_lines) if (total_lines > 0) and visible_lines else True
 
     seconds = round(_estimate_reading_seconds(visible_lines), 1)
-    if verbose:
-        print(f"[글 읽기] {seconds}초 대기")
+    print_json({"action": "read_article", "reading_time": seconds}, verbose)
     if wait_until_read:
-        wait(seconds)
+        wait(max(seconds, 0.1))
 
     if contents_only:
         keys = ["lines", "visible_lines", "total_lines", "read_start", "read_end", "read_done"]
@@ -253,7 +256,7 @@ def read_full_article(
         page: Page,
         action_delay: Delay = (0.3, 0.6),
         wait_until_read: bool = True,
-        verbose: bool = False,
+        verbose: int = 0,
         contents_only: bool = False,
         timeout: float = 30.,
     ) -> ArticleInfo | Contents:
@@ -264,6 +267,9 @@ def read_full_article(
     while (not contents["read_done"]) and ((end_time() - start_time) < timeout):
         next_lines(page, action_delay)
         contents = read_article(page, wait_until_read, verbose, contents_only=True)
+    if read_comments(page):
+        ranges = get_cafe_ranges(page, header=True, tab=False)
+        safe_wheel(page, target=page.locator(".CommonComment .write").first, **ranges), wait(action_delay)
 
     if contents_only:
         contents["read_start"] = read_start
@@ -330,6 +336,7 @@ def _count_english_chars(text) -> int:
 ###################################################################
 
 def like_article(page: Page, action_delay: Delay = (0.3, 0.6)):
+    """## Action 6"""
     like_button = page.locator('.right_area [data-type="like"]').first
     if like_button.get_attribute("aria-pressed") == "false":
         like_button.tap(), wait(action_delay)
@@ -347,6 +354,7 @@ def write_comment(
         upload_delay: Delay = (2, 4),
         dry_run: bool = False,
     ):
+    """## Action 7"""
     page.locator(".right_area .f_reply").first.tap(), wait(goto_delay)
     comment_area = page.locator(".comment_textarea").first
     comment_area.locator(".textarea_write").first.tap(), wait(action_delay)
@@ -371,24 +379,22 @@ def read_comments(page: Page) -> list[str]:
 
 def read_article_and_write_comment(
         page: Page,
-        cafe_name: str,
-        menu_name: str,
+        comment_limit: str = "20자 이내",
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         upload_delay: Delay = (2, 4),
         wait_until_read: bool = True,
-        model: ChatModel | None = None,
-        messages: str | Path | list[Prompt] | None = None,
-        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
-        verbose: bool = False,
+        prompt: Prompt5 = dict(),
+        verbose: int = 0,
         dry_run: bool = False,
         timeout: float = 30.,
         **kwargs
     ) -> tuple[ArticleInfo, Comment]:
+    """## Action 5+7"""
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
     contents = read_article(page, wait_until_read=False, verbose=verbose, contents_only=True)
     article_info = _make_article_info(page, contents["lines"])
-    comment = create_comment(cafe_name, menu_name, article_info, model, messages, reasoning_effort, verbose, **kwargs)
+    comment = create_comment(article_info, comment_limit, **prompt, verbose=verbose, **kwargs)
 
     if wait_until_read:
         current_wait = round(_estimate_reading_seconds(contents["visible_lines"]), 1)
@@ -399,7 +405,10 @@ def read_article_and_write_comment(
 
         while (not contents["read_done"]) and ((end_time() - start_time) < timeout):
             next_lines(page, action_delay)
-            read_article(page, wait_until_read=True, verbose=verbose)
+            contents = read_article(page, wait_until_read=True, verbose=verbose, contents_only=True)
+        if article_info["comments"]:
+            ranges = get_cafe_ranges(page, header=True, tab=False)
+            safe_wheel(page, target=page.locator(".CommonComment .write").first, **ranges), wait(action_delay)
 
     if comment:
         write_comment(page, comment, action_delay, goto_delay, upload_delay, dry_run)
@@ -412,22 +421,21 @@ def read_article_and_write_comment(
 
 def write_article(
         page: Page,
-        cafe_name: str,
-        menu_name: str,
         articles: Iterable[ArticleInfo],
         history: Iterable[str] = list(),
+        title_limit: str = "30자 이내",
+        contents_limit: str = "300자 이내",
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         upload_delay: Delay = (2, 4),
-        model: ChatModel | None = None,
-        messages: str | Path | list[Prompt] | None = None,
-        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
-        verbose: bool = False,
+        prompt: Prompt5 = dict(),
+        verbose: int = 0,
         dry_run: bool = False,
         **kwargs
     ) -> NewArticle:
+    """## Action 8"""
     page.locator(".FloatingWriteButton > button").first.tap(), wait(goto_delay)
-    article = create_article(cafe_name, menu_name, articles, history, model, messages, reasoning_effort, verbose, **kwargs)
+    article = create_article(articles, history, title_limit, contents_limit, **prompt, verbose=verbose, **kwargs)
 
     title_area = page.locator(".ArticleWriteFormSubject textarea").first
     title_area.tap(), wait(action_delay)
@@ -453,35 +461,49 @@ def write_article(
 
 def read_history(
         page: Page,
-        action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         n_articles: int | None = 10,
         read_articles: bool = True,
         wait_until_read: bool = True,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> list[ArticleInfo]:
-    page.tap(f'header button:has-text("메뉴")'), wait(action_delay)
+    """## Action 9"""
+    data = list()
+    for item in locate_all(page, ".list_area .txt_area")[:n_articles]:
+        if read_articles:
+            safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
+            try:
+                data.append(read_article(page, wait_until_read, verbose, contents_only=False))
+            finally:
+                go_back(page, goto_delay)
+        else:
+            data.append({
+                "title": item.locator(".tit").text_content().strip(),
+                "contents": list(),
+                "comments": list(),
+                "created_at": _to_iso_date(item.locator(".time").text_content().strip()),
+            })
+    return data
+
+
+def open_info(page: Page, action_delay: Delay = (0.3, 0.6), goto_delay: Delay = (1, 3)):
+    open_menu(page, action_delay)
     page.tap("header .info_link"), wait(goto_delay)
 
-    data = list()
-    try:
-        for item in locate_all(page, ".list_area .txt_area")[:n_articles]:
-            if read_articles:
-                safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
-                try:
-                    data.append(read_article(page, wait_until_read, verbose, contents_only=False))
-                finally:
-                    go_back(page, goto_delay)
-            else:
-                data.append({
-                    "title": item.locator(".tit").text_content().strip(),
-                    "contents": list(),
-                    "comments": list(),
-                    "created_at": _to_iso_date(item.locator(".time").text_content().strip()),
-                })
-        return data
-    finally:
-        page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
+
+def close_info(page: Page, goto_delay: Delay = (1, 3)):
+    page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
+
+
+def parse_action_log(page: Page) -> dict[str,int]:
+    def safe_int(value: str) -> int:
+        try:
+            return int(value)
+        except:
+            return
+    keys = [span.text_content().strip() for span in locate_all(page, ".myinfo_detail .detail_title")]
+    values = [safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
+    return dict(zip(keys, values))
 
 
 def _get_info_ranges(page: Page) -> CafeRanges:

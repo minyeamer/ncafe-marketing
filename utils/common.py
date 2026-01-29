@@ -3,11 +3,17 @@ from __future__ import annotations
 from playwright.sync_api import Locator #, Page
 
 from typing import TypeVar
+import json
 import random
 import time
 
 Delay = TypeVar("Delay", float, tuple)
 Steps = TypeVar("Steps", int, tuple)
+
+
+def print_json(data: dict | list, verbose: int = 0):
+    if verbose > 0:
+        print(json.dumps(data, indent=(2 if verbose > 1 else None), ensure_ascii=False, default=str))
 
 
 def wait(delay: float | tuple[float, float] | None = None, ndigits: int | None = None):
