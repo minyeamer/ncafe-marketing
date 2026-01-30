@@ -1,0 +1,130 @@
+from __future__ import annotations
+import functools
+
+from playwright.sync_api import sync_playwright, Playwright
+from playwright.sync_api import Browser, BrowserContext, Page
+
+from utils.common import Delay
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+MOBILE_DEVICE = "Galaxy S24"
+
+
+class BrowserDelay:
+
+    def __init__(
+            self,
+            action: Delay = (0.3, 0.6),
+            goto: Delay = (1, 3),
+            upload: Delay = (2, 4),
+        ):
+        self.action = action
+        self.goto = goto
+        self.upload = upload
+
+    def get_delays(self, keys: list[str]) -> dict[str,Delay]:
+        return {f"{key}_delay": getattr(self, key) for key in keys}
+
+
+class BrowserState:
+
+    def __init__(self):
+        self.__playwright: Playwright = None
+        self.__browser: Browser = None
+        self.__context: BrowserContext = None
+        self.__page: Page = None
+
+    @property
+    def playwright(self) -> Playwright:
+        return self.__playwright
+
+    @property
+    def browser(self) -> Browser:
+        return self.__browser
+
+    @property
+    def context(self) -> BrowserContext:
+        return self.__context
+
+    @property
+    def page(self) -> Page:
+        return self.__page
+
+    def set_playwright(self, playwright: Playwright):
+        self.__playwright = playwright
+
+    def launch_browser(self, **kwargs):
+        self.browser = self.__playwright.chromium.launch(**kwargs)
+
+    def close_browser(self):
+        self.__browser.close()
+
+    def new_context(self, device: str = str(), **kwargs):
+        if device:
+            kwargs.update(self.__playwright.devices[device])
+        self.__context = self.__browser.new_context(**kwargs)
+
+    def new_page(self):
+        self.__page = self.__context.new_page()
+
+
+class BrowserController:
+
+    def __init__(
+            self,
+            device: str = str(),
+            mobile: bool = True,
+            headless: bool = False,
+            action_delay: Delay = (0.3, 0.6),
+            goto_delay: Delay = (1, 3),
+            upload_delay: Delay = (2, 4),
+        ):
+        self.device: str = device
+        self.mobile: bool = mobile
+        self.headless: bool = headless
+        self.delays: BrowserDelay = BrowserDelay(action_delay, goto_delay, upload_delay)
+        self.states: BrowserState = BrowserState()
+
+    @property
+    def playwright(self) -> Playwright:
+        return self.states.playwright
+
+    @property
+    def browser(self) -> Browser:
+        return self.states.browser
+
+    @property
+    def context(self) -> BrowserContext:
+        return self.states.context
+
+    @property
+    def page(self) -> Page:
+        return self.states.page
+
+    def reset_states(self):
+        del self.states
+        self.states = BrowserState()
+
+    def with_browser(func):
+        @functools.wraps(func)
+        def wrapper(self: BrowserController, *args, state: str | Path | None = None, **kwargs):
+            self.reset_states()
+            try:
+                with sync_playwright() as playwright:
+                    self.states.set_playwright(playwright)
+                    self.states.launch_browser(headless=self.headless)
+                    try:
+                        self.states.new_context(**dict(storage_state=state) if state else dict())
+                        self.states.new_page()
+                        return func(*args, **kwargs)
+                    finally:
+                        if state:
+                            self.context.storage_state(path=state)
+                        self.states.close_browser()
+            finally:
+                self.reset_states()
+        return wrapper

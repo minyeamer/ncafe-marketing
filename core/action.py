@@ -462,7 +462,7 @@ def write_article(
 def read_history(
         page: Page,
         goto_delay: Delay = (1, 3),
-        n_articles: int | None = 10,
+        n_articles: int | None = None,
         read_articles: bool = True,
         wait_until_read: bool = True,
         verbose: int = 0,
