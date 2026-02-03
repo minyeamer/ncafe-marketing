@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from playwright.sync_api import Page
-from core.home import goto_naver_main, goto_cafe_home
+from core.action import goto_naver_main, goto_cafe_home
 from utils.common import wait, Delay
 
 from typing import TYPE_CHECKING
@@ -38,7 +38,7 @@ def login(
     elif page.locator("#rcapt").count() > 0:
         raise ReCaptchaRequiredError(f"[{userid}] 자동입력 방지 문자를 입력해주세요.")
     else:
-        goto_cafe_home(page, mobile, action_delay, goto_delay)
+        goto_cafe_home(page, mobile, action_delay, goto_delay) # Action 0
 
 
 def wander_around(page: Page, mobile: bool = True, goto_delay: Delay = (1, 3)):
@@ -54,7 +54,7 @@ def login_begin(
         goto_delay: Delay = (1, 3),
     ):
     if referer == "cafe":
-        goto_cafe_home(page, mobile, action_delay, goto_delay)
+        goto_cafe_home(page, mobile, action_delay, goto_delay) # Action 0
         if mobile:
             page.tap('.login_wrap a[role="button"]'), wait(goto_delay)
         else:

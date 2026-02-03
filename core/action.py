@@ -21,7 +21,8 @@ import re
 import time
 
 if TYPE_CHECKING:
-    from typing import Iterable, Literal, Set
+    from typing import Iterable, Literal
+    from pathlib import Path
 
 MenuName = TypeVar("MenuName", bound=str)
 ArticleId = TypeVar("ArticleId", bound=str)
@@ -67,6 +68,53 @@ def _to_iso_datetime(text: str) -> str:
 
 
 ###################################################################
+################### Action 0 - :goto_cafe_home: ###################
+###################################################################
+
+def goto_cafe_home(
+        page: Page,
+        mobile: bool = True,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+    ):
+    """## Action 0"""
+    if page.url == cafe_url(mobile):
+        return
+    goto_naver_main(page, mobile, goto_delay)
+
+    if mobile:
+        page.tap('#MM_logo [href="/aside/"]'), wait(goto_delay)
+        if page.locator(".layer_alert").count() > 0:
+            page.tap(".layer_alert .la_option"), wait(action_delay)
+        page.tap('[href="https://m.cafe.naver.com"]'), wait(goto_delay)
+    else:
+        page.goto(cafe_url(mobile=False)), wait(goto_delay)
+        # :has(a[href="https://cafe.naver.com"][target="_blank"])
+        # from ncafe.utils.desktop import click_new_page
+        # click_new_page(context, page, '[href="https://cafe.naver.com"]')
+
+
+def goto_naver_main(
+        page: Page,
+        mobile: bool = True,
+        goto_delay: Delay = (1, 3),
+    ):
+    if page.url != main_url(mobile):
+        page.goto(main_url(mobile)), wait(goto_delay)
+
+
+def main_url(mobile: bool) -> str:
+    return f"https://{'m.' if mobile else 'www.'}naver.com"
+
+
+def cafe_url(mobile: bool) -> str:
+    if mobile:
+        return "https://m.cafe.naver.com/"
+    else:
+        return "https://section.cafe.naver.com/ca-fe/home"
+
+
+###################################################################
 ###################### Action 1 - :goto_cafe: #####################
 ###################################################################
 
@@ -92,8 +140,14 @@ def get_cafe_ranges(page: Page, header: bool = True, tab: bool = False) -> CafeR
 
 
 def _get_cafe_overlay(page: Page, header: bool = True, tab: bool = False) -> Overlay:
-    header_height = page.locator(".WebHeader").first.bounding_box()["height"] if header else 0
-    tab_height = page.locator(".ArticleTab").first.bounding_box()["height"] if tab else 0
+    try:
+        header_height = page.locator(".WebHeader").first.bounding_box()["height"] if header else 0
+    except Exception:
+        header_height = 52
+    try:
+        tab_height = page.locator(".ArticleTab").first.bounding_box()["height"] if tab else 0
+    except Exception:
+        tab_height = 66
     return dict(top = (header_height + tab_height))
 
 
@@ -140,20 +194,20 @@ def _get_menu_overlay(page: Page) -> Overlay:
 
 def explore_articles(
         page: Page,
-        visited: Set[ArticleId] = set(),
+        visited: set[ArticleId] = set(),
         prompt: Prompt4 = dict(),
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> list[ArticleParams]:
     """## Action 3"""
     articles = list_articles(page, visited)
     if articles:
-        return select_articles(articles, **prompt, verbose=verbose, **kwargs)
+        return select_articles(articles, **prompt, verbose=verbose, **kwargs) # Agent 1
     else:
         return list()
 
 
-def list_articles(page: Page, visited: Set[ArticleId] = set()) -> list[ArticleParams]:
+def list_articles(page: Page, visited: set[ArticleId] = set()) -> list[ArticleParams]:
     articles = list()
     for article in locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True)):
         params = _parse_params(article.get_attribute("href") or str())
@@ -208,7 +262,7 @@ def goto_article(page: Page, id: str | int | Literal["random"], goto_delay: Dela
 def read_article(
         page: Page,
         wait_until_read: bool = True,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         contents_only: bool = False,
     ) -> ArticleInfo | Contents:
     """## Action 5"""
@@ -256,7 +310,7 @@ def read_full_article(
         page: Page,
         action_delay: Delay = (0.3, 0.6),
         wait_until_read: bool = True,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         contents_only: bool = False,
         timeout: float = 30.,
     ) -> ArticleInfo | Contents:
@@ -385,7 +439,7 @@ def read_article_and_write_comment(
         upload_delay: Delay = (2, 4),
         wait_until_read: bool = True,
         prompt: Prompt5 = dict(),
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         dry_run: bool = False,
         timeout: float = 30.,
         **kwargs
@@ -394,7 +448,7 @@ def read_article_and_write_comment(
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
     contents = read_article(page, wait_until_read=False, verbose=verbose, contents_only=True)
     article_info = _make_article_info(page, contents["lines"])
-    comment = create_comment(article_info, comment_limit, **prompt, verbose=verbose, **kwargs)
+    comment = create_comment(article_info, comment_limit, **prompt, verbose=verbose, **kwargs) # Agent 2
 
     if wait_until_read:
         current_wait = round(_estimate_reading_seconds(contents["visible_lines"]), 1)
@@ -422,20 +476,20 @@ def read_article_and_write_comment(
 def write_article(
         page: Page,
         articles: Iterable[ArticleInfo],
-        history: Iterable[str] = list(),
+        my_articles: Iterable[str] = list(),
         title_limit: str = "30자 이내",
         contents_limit: str = "300자 이내",
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         upload_delay: Delay = (2, 4),
         prompt: Prompt5 = dict(),
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         dry_run: bool = False,
         **kwargs
     ) -> NewArticle:
     """## Action 8"""
     page.locator(".FloatingWriteButton > button").first.tap(), wait(goto_delay)
-    article = create_article(articles, history, title_limit, contents_limit, **prompt, verbose=verbose, **kwargs)
+    article = create_article(articles, my_articles, title_limit, contents_limit, **prompt, verbose=verbose, **kwargs)
 
     title_area = page.locator(".ArticleWriteFormSubject textarea").first
     title_area.tap(), wait(action_delay)
@@ -456,16 +510,16 @@ def write_article(
 
 
 ###################################################################
-#################### Action 9 - :read_history: ####################
+################## Action 9 - :read_my_articles: ##################
 ###################################################################
 
-def read_history(
+def read_my_articles(
         page: Page,
         goto_delay: Delay = (1, 3),
         n_articles: int | None = None,
         read_articles: bool = True,
         wait_until_read: bool = True,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
     ) -> list[ArticleInfo]:
     """## Action 9"""
     data = list()
@@ -495,15 +549,17 @@ def close_info(page: Page, goto_delay: Delay = (1, 3)):
     page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
 
 
-def parse_action_log(page: Page) -> dict[str,int]:
+def read_action_log(page: Page, action_delay: Delay = (0.3, 0.6)) -> dict[str,int]:
+    open_menu(page, action_delay)
     def safe_int(value: str) -> int:
-        try:
-            return int(value)
-        except:
-            return
-    keys = [span.text_content().strip() for span in locate_all(page, ".myinfo_detail .detail_title")]
-    values = [safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
-    return dict(zip(keys, values))
+        try: return int(value)
+        except: return
+    try:
+        keys = [span.text_content().strip() for span in locate_all(page, ".myinfo_detail .detail_title")]
+        values = [safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
+        return dict(zip(keys, values))
+    finally:
+        page.touchscreen.tap(0, 0), wait(action_delay)
 
 
 def _get_info_ranges(page: Page) -> CafeRanges:

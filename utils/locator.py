@@ -64,7 +64,7 @@ def locate(
         boundary: Locator | None = None,
         overlay: Overlay | None = None,
         threshold: float = 0.5,
-    ) -> Locator:
+    ) -> Locator | None:
     kwargs = dict(has_text=has_text, has_not_text=has_not_text, has=has, has_not=has_not)
     locator = page.locator(selector, **kwargs)
     if (element := locator.first):

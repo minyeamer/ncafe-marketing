@@ -131,7 +131,7 @@ def chat(
         model: ChatModel,
         messages: list[Message],
         agent_name: str | None = None,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> str:
     start_time = time.perf_counter()
@@ -150,7 +150,7 @@ def chat_json(
         model: str,
         messages: list[Message],
         agent_name: str | None = None,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> dict | list:
     start_time = time.perf_counter()
@@ -192,7 +192,7 @@ def select_articles(
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         temperature: float | None = 0.1,
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> list[ArticleParams]:
     """
@@ -248,7 +248,7 @@ def create_comment(
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> str:
     """
@@ -297,14 +297,14 @@ def create_comment(
 
 def create_article(
         articles: Iterable[ArticleInfo] = list(),
-        history: Iterable[str] = list(),
+        my_articles: Iterable[str] = list(),
         title_limit: str = "30자 이내",
         contents_limit: str = "300자 이내",
         model: ChatModel | None = None,
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
-        verbose: int = 0,
+        verbose: int | str | Path = 0,
         **kwargs
     ) -> NewArticle:
     """
@@ -321,7 +321,7 @@ def create_article(
             "comments": ["댓글1", "댓글2"],
             "created_at": "2026-01-02T12:04:05+09:00"
         }],
-        "history": [{
+        "my_articles": [{
             "title": "제목",
             "contents": ["문장1", "![alt](url)", "문장2"],
             "comments": ["댓글1", "댓글2"],
@@ -337,7 +337,7 @@ def create_article(
     """
     name = "create_article"
     if messages is None:
-        data = {"articles": list(articles), "history": list(history), "current_time": cur_time()}
+        data = {"articles": list(articles), "my_articles": list(my_articles), "current_time": cur_time()}
         limit = dict(title_limit=title_limit, contents_limit=contents_limit)
         model, messages = read_markdown(markdown_path, min_json(data), model, **limit)
         print_json({"agent_name": name, "user_message": data}, verbose)
