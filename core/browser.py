@@ -7,6 +7,7 @@ from playwright.sync_api import Browser, BrowserContext, Page
 from utils.common import AttrDict, Delay
 
 from typing import TYPE_CHECKING
+import os
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,7 +125,10 @@ class BrowserController(AttrDict):
                     self.states.set_playwright(playwright)
                     self.states.launch_browser(headless=self.headless)
                     try:
-                        self.states.new_context(self.device, **(dict(storage_state=state) if state else dict()))
+                        if state and os.path.exists(str(state)):
+                            self.states.new_context(self.device, storage_state=state)
+                        else:
+                            self.states.new_context(self.device)
                         self.states.new_page()
                         return func(self, *args, **kwargs)
                     finally:

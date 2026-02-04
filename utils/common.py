@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     _KT = TypeVar("_KT", Hashable)
     _VT = TypeVar("_VT", Any)
 
-Delay = TypeVar("Delay", float, tuple)
+Delay = TypeVar("Delay", float, list, tuple)
 Steps = TypeVar("Steps", int, tuple)
 
 DictRecursive = TypeVar("DictRecursive", bound=dict)
@@ -73,10 +73,10 @@ def print_json(data: dict | list, verbose: int | str | Path = 0):
             file.write('\n')
 
 
-def wait(delay: float | tuple[float, float] | None = None, ndigits: int | None = None):
+def wait(delay: Delay | None = None, ndigits: int | None = None):
     if delay is None:
         return
-    elif isinstance(delay, tuple) and (len(delay) == 2):
+    elif isinstance(delay, (list,tuple)) and (len(delay) == 2):
         timeout = random.uniform(*delay)
         if isinstance(ndigits, int):
             timeout = round(timeout, ndigits)

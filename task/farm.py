@@ -10,20 +10,25 @@ from core.action import like_article, write_article
 from core.action import read_my_articles, open_info, close_info, read_action_log
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 
+from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
+from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
+
 from utils.common import AttrDict, Delay, wait, print_json
-from utils.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
 from utils.timer import ActionTimer
 
 from typing import get_type_hints, TypeVar, TypedDict, TYPE_CHECKING
 from collections import defaultdict, deque
-from pathlib import Path
 import datetime as dt
 import json
+
+from pathlib import Path
 import os
 import random
+import sys
+import traceback
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Literal, Sequence
+    from typing import Any, Callable, Literal
     from core.action import ArticleId, ArticleInfo, Comment, NewArticle
 
 
@@ -53,6 +58,7 @@ class MaxLoopExceeded(RuntimeError):
 class Config(TypedDict):
     userid: str
     passwd: str
+    ip_addr: str
     enabled: bool
     cafe_name: str
     menu_name: str
@@ -96,6 +102,7 @@ class ConfigWrapper(AttrDict):
         super().__init__()
         self.userid = config["userid"]
         self.passwd = config["passwd"]
+        self.ip_addr = config["ip_addr"]
         self.cafe_name = config["cafe_name"]
         self.menu_name = config["menu_name"]
 
@@ -148,6 +155,11 @@ class ArticleActivity(TypedDict):
     like_this: bool
 
 
+class ErrorLog(TypedDict):
+    type: str
+    exc_info: str
+
+
 class TaskLog(AttrDict):
 
     def __init__(self):
@@ -160,6 +172,7 @@ class TaskLog(AttrDict):
         self.read_articles: list[ArticleActivity] = list()
         self.my_articles: deque[ArticleInfo] = deque()
         self.written_articles: list[NewArticle] = list()
+        self.error: ErrorLog | None = None
 
     def to_json(self, ellipsis_list: bool = False) -> dict:
         def serialize(kv: tuple[str, Any]) -> tuple[str, Any]:
@@ -192,10 +205,11 @@ class Farmer(BrowserController):
             headless: bool = True,
             action_delay: Delay = (0.3, 0.6),
             goto_delay: Delay = (1, 3),
-            reload_delay: Delay = (3, 5),
+            reload_delay: Delay = (10, 12),
             upload_delay: Delay = (2, 4),
             comment_threshold: float = 0.3,
             like_threshold: float = 0.4,
+            vpn_config: VpnConfig = dict(),
         ):
         super().__init__(device, mobile, headless, action_delay, goto_delay, reload_delay, upload_delay)
         self.credentials = ServiceAccount(DEFAULTS["account"] if is_default(account) else account)
@@ -204,6 +218,7 @@ class Farmer(BrowserController):
         self.index = 0
         self.__logs: dict[UserId, TaskLog] = defaultdict(TaskLog)
         self.__timers: dict[UserId, ActionTimer] = defaultdict(ActionTimer)
+        self.set_vpn_client(vpn_config)
         set_api_key(DEFAULTS["openai_key"] if is_default(openai_key) else openai_key)
 
     @property
@@ -236,22 +251,34 @@ class Farmer(BrowserController):
         records = client.get_all_records(head=2, numericise_ignore=str_keys)
         return [ConfigWrapper(record) for record in records if record["enabled"]]
 
+    ########################### Entry Point ###########################
+
     def start(
             self,
-            has_state: bool = True,
+            with_state: bool = True,
             max_steps: int = 100,
+            reload_start_step: int = 10,
             num_my_articles: int = 10,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             save_log: bool = True,
             **kwargs
         ):
+        if self.vpn_enabled:
+            self.vpn.start_process(self.vpn_config.force_restart)
+            if not self.vpn.try_login(**self.vpn_config.login):
+                self.vpn.restart_service(**self.vpn_config.login)
+
         for i in range(len(self.configs)):
             self.index = i
-            if has_state:
+
+            if with_state:
                 states_root = Path(STATES_ROOT)
                 states_root.mkdir(parents=True, exist_ok=True)
                 kwargs["state"] = states_root / (self.userid + ".json")
+                has_state = os.path.exists(str(kwargs["state"]))
+            else:
+                has_state = False
 
             print_json(dict(
                 task_step = "loop_start",
@@ -261,10 +288,26 @@ class Farmer(BrowserController):
                 state = str(kwargs.get("state"))), verbose)
 
             try:
-                self.do_actions(has_state, max_steps, num_my_articles, verbose, dry_run, **kwargs)
-            finally:
-                self.log.time_on_cafe = self.timer.end_timer("visit", 3)
-                self.log.last_active_ts = dt.datetime.now()
+                vpn_connected = False
+                if self.vpn_enabled and self.config.ip_addr:
+                    vpn_connected = bool(self.vpn.search_and_connect(**self.vpn_config.search_and_connect))
+
+                try:
+                    args = (has_state, max_steps, reload_start_step, num_my_articles, verbose, dry_run)
+                    self.do_actions(*args, **kwargs)
+                finally:
+                    if vpn_connected:
+                        self.vpn.disconnect(**self.vpn_config.wait_options)
+            except VpnRuntimeError as error:
+                self.vpn.restart_service(**self.vpn_config.login)
+                exc_info = '\n'.join(traceback.format_exception(*sys.exc_info()))
+                self.log.error = dict(type=str(type(error).__name__), exc_info=exc_info)
+            except Exception as exception:
+                exc_info = '\n'.join(traceback.format_exception(*sys.exc_info()))
+                self.log.error = dict(type=str(type(exception).__name__), exc_info=exc_info)
+
+            self.log.time_on_cafe = self.timer.end_timer("visit", 3)
+            self.log.last_active_ts = dt.datetime.now()
 
             print_json(dict(
                 task_step = "loop_end",
@@ -280,6 +323,7 @@ class Farmer(BrowserController):
             self,
             has_state: bool = True,
             max_steps: int = 100,
+            reload_start_step: int = 10,
             num_my_articles: int = 10,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -292,7 +336,7 @@ class Farmer(BrowserController):
         if self.need_my_articles((n := num_my_articles)):
             self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
 
-        self.action_loop(max_steps, verbose, dry_run)
+        self.action_loop(max_steps, reload_start_step, verbose, dry_run)
 
         if self.check_member_level():
             self.config.reset_counter("article")
@@ -308,6 +352,7 @@ class Farmer(BrowserController):
     def action_loop(
             self,
             max_steps: int = 100,
+            reload_start_step: int = 10,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
         ):
@@ -318,7 +363,7 @@ class Farmer(BrowserController):
         while self.has_next_action():
             if step >= max_steps:
                 raise MaxLoopExceeded(f"[{self.userid}] 최대 루프 횟수에 도달했습니다.")
-            elif step > 10:
+            elif step > reload_start_step:
                 wait(self.delays.reload)
                 reload_articles(self.page, self.delays.goto)
             elif step > 1:
@@ -495,3 +540,21 @@ class Farmer(BrowserController):
         return new
 
     ############################# Loop End ############################
+
+    @property
+    def vpn(self) -> VpnClient:
+        if self.__vpn is not None:
+            return self.__vpn
+        else:
+            raise RuntimeError("VPN 클라이언트가 초기화되지 않았습니다.")
+
+    def set_vpn_client(self, vpn_config: VpnConfig = dict()):
+        if vpn_config:
+            config = vpn_config if isinstance(vpn_config, VpnConfig) else VpnConfig(**vpn_config)
+            self.__vpn = VpnClient(**config)
+            self.vpn_config = config
+            self.vpn_enabled = True
+        else:
+            self.__vpn = None
+            self.vpn_config = None
+            self.vpn_enabled = False
