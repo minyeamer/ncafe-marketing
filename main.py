@@ -41,6 +41,8 @@ class RunConfig(TypedDict, total=False):
     max_action_loop: int
     reload_start_step: int
     num_my_articles: int
+    task_delay: float
+    vpn_delay: float
     with_state: bool
     verbose: int | str | Path
     dry_run: bool

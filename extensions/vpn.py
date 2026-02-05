@@ -25,7 +25,10 @@ IpAddress = TypeVar("IpAddress", bound=str)
 class VpnRuntimeError(RuntimeError):
     ...
 
-class ElementNotFoundError(VpnRuntimeError):
+class WindowNotFoundError(RuntimeError):
+    ...
+
+class ElementNotFoundError(RuntimeError):
     ...
 
 class VpnLoginFailedError(VpnRuntimeError):
@@ -97,7 +100,7 @@ class Client(AttrDict):
 
         if error_msg == ":default:":
             error_msg = f"패턴 '{title_patttern.pattern}'에 매칭되는 윈도우를 찾을 수 없습니다."
-        raise TimeoutError(error_msg)
+        raise WindowNotFoundError(error_msg)
 
     def catch_window(self, title_patttern: re.Pattern[str]) -> UIAWrapper | None:
         windows: list[UIAWrapper] = self.desktop.windows()
@@ -248,7 +251,7 @@ class VpnClient(Client):
         try:
             self.wait_service_ui(**wait_options)
             return True
-        except TimeoutError:
+        except WindowNotFoundError:
             if window.descendants(control_type="Window"):
                 confirm_btn: ButtonWrapper = window.descendants(control_type="Button", title="확인")[0]
                 confirm_btn.click_input()

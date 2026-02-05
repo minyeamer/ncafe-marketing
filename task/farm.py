@@ -17,6 +17,7 @@ from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
 from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
 from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
+from extensions.vpn import WindowNotFoundError, ElementNotFoundError
 
 from utils.common import AttrDict, Delay, wait, print_json
 from utils.timer import ActionTimer
@@ -134,8 +135,16 @@ class ConfigWrapper(AttrDict):
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
 
-    def has_next_action(self) -> bool:
-        return ((self.counter["comment"] > 0) or (self.counter["like"] > 0) or ((self.counter["article"] > 0)))
+        self.qualified: bool = None
+        self.__done: bool = None
+
+    @property
+    def done(self) -> bool:
+        if not self.__done:
+            self.__done = ((self.counter["comment"] > 0) or (self.counter["like"] > 0) or ((self.counter["article"] > 0)))
+            return self.__done
+        else:
+            return True
 
     def calc_counter(self, key: Literal["read","comment","article","like"]) -> int:
         return self.__counter.get(key, 0) - self.counter.get(key, 0)
@@ -155,6 +164,7 @@ class ConfigWrapper(AttrDict):
     def zero_counter(self, key: Literal["all","read","comment","article","like"]):
         if key == "all":
             self.counter[key] = {key: 0 for key in self.counter.keys()}
+            self.__done = True
         else:
             self.counter[key] = 0
 
@@ -188,7 +198,7 @@ class ArticleActivity(TypedDict):
 
 
 ErrorFlag = Literal[
-    "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류",
+    "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
     "가입카페 확인 불가", "반복 횟수 초과", "금지 시간대", "브라우저 조작 오류"]
 
@@ -332,6 +342,8 @@ class Farmer(BrowserController):
             max_action_loop: int = 100,
             reload_start_step: int = 10,
             num_my_articles: int = 10,
+            task_delay: float = 5.,
+            vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -348,18 +360,19 @@ class Farmer(BrowserController):
         stop_task: StopTask = None
 
         for _ in range(max_task_loop):
-            if stop_task or (not any([config.has_next_action() for config in self.configs])):
+            if stop_task or (not any([config.done for config in self.configs])):
                 break
 
             if isinstance(stop_task, bool):
                 comment_min_delay = self.min_action_delay("comment")
                 article_min_delay = self.min_action_delay("article")
-                if (min_delay := min(comment_min_delay, article_min_delay)):
-                    self.print_loop("wait", verbose, seconds=min_delay)
-                    wait(min_delay)
+                delay = max(task_delay, min(comment_min_delay, article_min_delay))
+
+                self.print_loop("wait", verbose, seconds=delay)
+                wait(delay)
 
             stop_task = self.task_loop(
-                max_action_loop, reload_start_step, num_my_articles, with_state, verbose, dry_run, save_log)
+                max_action_loop, reload_start_step, num_my_articles, vpn_delay, with_state, verbose, dry_run, save_log)
 
             if self.write_config:
                 try:
@@ -381,9 +394,10 @@ class Farmer(BrowserController):
 
     def task_loop(
             self,
-            max_steps: int = 100,
+            max_action_loop: int = 100,
             reload_start_step: int = 10,
             num_my_articles: int = 10,
+            vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -394,23 +408,26 @@ class Farmer(BrowserController):
         for i in range(len(self.configs)):
             self.index = i
 
-            if stop_task:
+            if self.config.done:
+                continue
+            elif stop_task:
                 self.print_loop("break", verbose)
                 self.config.zero_counter("all")
                 continue
 
             state = self.browser_state if with_state else None
             self.print_loop("start", verbose, state=state)
+            vpn_connected = False
 
             try:
                 self.check_quiet_hours()
-                vpn_connected = False
+
                 if self.vpn_enabled and (ip_addr := self.config.ip_addr):
                     self.vpn.try_login(**self.vpn_config.login)
                     vpn_connected = bool(self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect))
 
                 try:
-                    self.do_actions(max_steps, reload_start_step, num_my_articles, verbose, dry_run, state=state)
+                    self.do_actions(max_action_loop, reload_start_step, num_my_articles, verbose, dry_run, state=state)
                     self.log.error = None
                 finally:
                     if vpn_connected:
@@ -433,12 +450,15 @@ class Farmer(BrowserController):
 
             stop_task = self.handle_error_flag(flag)
 
+            if (not stop_task) and vpn_connected:
+                wait(vpn_delay)
+
         return stop_task
 
     @BrowserController.with_browser
     def do_actions(
             self,
-            max_steps: int = 100,
+            max_action_loop: int = 100,
             reload_start_step: int = 10,
             num_my_articles: int = 10,
             verbose: int | str | Path = 0,
@@ -448,25 +468,27 @@ class Farmer(BrowserController):
         ):
         self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
 
-        qualified_before = self.check_member_level()
-        if not qualified_before:
-            self.config.zero_counter("article")
+        qualified = self.check_member_level()
+        self.config.qualified = qualified
 
-        if self.need_my_articles((n := num_my_articles)):
+        if not qualified:
+            self.config.zero_counter("article")
+        elif self.need_my_articles((n := num_my_articles)):
             self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
 
-        self.action_loop(max_steps, reload_start_step, verbose, dry_run)
-
-        qualified_after = self.check_member_level()
-        if (not qualified_before) and qualified_after:
-            self.config.reset_counter("article")
+        try:
+            self.action_loop(max_action_loop, reload_start_step, verbose, dry_run)
+            self.config.qualified = self.check_member_level()
+        finally:
+            if not qualified:
+                self.config.reset_counter("article")
 
     ############################# <start> #############################
     ########################### Action Loop ###########################
 
     def action_loop(
             self,
-            max_steps: int = 100,
+            max_action_loop: int = 100,
             reload_start_step: int = 10,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -475,12 +497,13 @@ class Farmer(BrowserController):
         prompt = lambda agent: dict(markdown_path=os.path.join(root, f"{agent}.md"))
         articles, step, unselected_steps = list(), 1, 0
 
-        while self.has_next_action():
+        for step in range(max_action_loop, start=1):
             self.check_quiet_hours()
 
-            if step >= max_steps:
-                raise MaxLoopExceeded(f"[{self.index}] 최대 루프 횟수에 도달했습니다.")
-            elif step > reload_start_step:
+            if not self.has_next_action():
+                break
+
+            if step > reload_start_step:
                 wait(self.delays.reload)
                 reload_articles(self.page, self.delays.goto)
             elif step > 2:
@@ -510,7 +533,6 @@ class Farmer(BrowserController):
             else:
                 unselected_steps = 0
 
-            step += 1
             self.log.total_steps += 1
 
     ########################### Action 0+1+2 ##########################
@@ -679,6 +701,10 @@ class Farmer(BrowserController):
                 return "VPN 접속 오류"
             else:
                 return "VPN 오류"
+        elif isinstance(error, WindowNotFoundError):
+            return "VPN 확인 불가"
+        elif isinstance(error, ElementNotFoundError):
+            return "VPN 조작 오류"
         elif isinstance(error, NaverLoginError):
             if isinstance(error, NaverLoginFailedError):
                 return "네이버 계정 불일치"
@@ -696,7 +722,8 @@ class Farmer(BrowserController):
             return "금지 시간대"
         elif isinstance(error, TimeoutError):
             return "브라우저 조작 오류"
-        return None
+        else:
+            return None
 
     def handle_error_flag(self, flag: ErrorFlag) -> StopTask:
         if not isinstance(flag, str):
@@ -705,7 +732,8 @@ class Farmer(BrowserController):
             try:
                 self.vpn.restart_service(**self.vpn_config.login)
                 self.config.zero_counter("all")
-            except:
+                return False
+            except Exception:
                 return True
         elif flag.startswith("네이버") or (flag == "가입카페 확인 불가"):
             userid = self.config.userid
@@ -714,7 +742,9 @@ class Farmer(BrowserController):
                     config.zero_counter("all")
             if flag.startswith("네이버") and (state := self.browser_state) and state.exists():
                 os.remove(str(state))
-        return (flag in {"VPN 로그인 오류", "VPN 오류", "금지 시간대"})
+            return False
+        else:
+            return flag.startswith("VPN") or (flag == "금지 시간대")
 
     ############################# Task Log ############################
 
