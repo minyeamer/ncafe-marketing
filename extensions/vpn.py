@@ -28,7 +28,7 @@ class VpnRuntimeError(RuntimeError):
 class ElementNotFoundError(VpnRuntimeError):
     ...
 
-class LoginFailedError(VpnRuntimeError):
+class VpnLoginFailedError(VpnRuntimeError):
     ...
 
 class VpnInUseError(VpnRuntimeError):
@@ -133,7 +133,7 @@ class VpnPattern(AttrDict):
 class WaitOptions(TypedDict, total=False):
     timeout: float
     interval: float
-    wait_after: float
+    after: float
 
 
 class VpnConfig(AttrDict):
@@ -145,14 +145,9 @@ class VpnConfig(AttrDict):
         service_name: str,
         userid: str = str(),
         passwd: str = str(),
-        ip_addr: str = str(),
-        subnet: str = str(),
-        service_no: int = 1,
         force_restart: bool = False,
         force_connect: bool = False,
-        wait_timeout: float = 30.,
-        wait_interval: float = 0.25,
-        wait_after: float | None = 0.5,
+        wait_options: WaitOptions = dict(),
     ):
         self.exe_path = exe_path
         self.process_name = process_name
@@ -160,12 +155,9 @@ class VpnConfig(AttrDict):
         self.service_name = service_name
         self.userid = userid
         self.passwd = passwd
-        self.ip_addr = ip_addr
-        self.service_no = service_no
-        self.subnet = subnet
         self.force_restart = force_restart
         self.force_connect = force_connect
-        self.wait_options: WaitOptions = dict(timeout=wait_timeout, interval=wait_interval, wait_after=wait_after)
+        self.wait_options = wait_options
 
     @property
     def login(self) -> dict:
@@ -173,13 +165,7 @@ class VpnConfig(AttrDict):
 
     @property
     def connect(self) -> dict:
-        keys = ["service_name", "service_no", "subnet", "force_connect", "on_failure"]
-        return dict({key: self[key] for key in keys}, **self.wait_options)
-
-    @property
-    def search_and_connect(self) -> dict:
-        keys = ["ip_addr", "service_name", "service_no", "subnet", "force_connect", "on_failure"]
-        return dict({key: self[key] for key in keys}, **self.wait_options)
+        return dict(service_name=self.service_name, force_connect=self.force_connect, **self.wait_options)
 
 
 ###################################################################
@@ -193,6 +179,7 @@ class VpnClient(Client):
             exe_path: str | Path,
             process_name: str,
             title_patterns: VpnPattern | dict[str, str | re.Pattern[str]],
+            **kwargs
         ):
         super().__init__(exe_path, process_name)
         if isinstance(title_patterns, VpnPattern):
@@ -204,10 +191,10 @@ class VpnClient(Client):
 
     def focus_window(func):
         @functools.wraps(func)
-        def wrapper(self: VpnClient, *args, wait_after: float | None = 0.5, **kwargs):
+        def wrapper(self: VpnClient, *args, after: float = 0.5, **kwargs):
             window: UIAWrapper = func(self, *args, **kwargs)
-            if wait_after:
-                time.sleep(wait_after)
+            if after:
+                time.sleep(after)
             window.set_focus()
             return window
         return wrapper
@@ -262,10 +249,10 @@ class VpnClient(Client):
             self.wait_service_ui(**wait_options)
             return True
         except TimeoutError:
-            if (dialogs := window.descendants(control_type="Window")):
+            if window.descendants(control_type="Window"):
                 confirm_btn: ButtonWrapper = window.descendants(control_type="Button", title="확인")[0]
                 confirm_btn.click_input()
-            raise LoginFailedError("입력하신 아이디 혹은 패스워드가 틀렸습니다. 계정 정보를 확인하여 다시 로그인해 주십시오.")
+            raise VpnLoginFailedError("입력하신 아이디 혹은 패스워드가 틀렸습니다. 계정 정보를 확인하여 다시 로그인해 주십시오.")
 
     def logout(self, **wait_options: float):
         window = self.wait_service_ui(**wait_options)
@@ -331,7 +318,7 @@ class VpnClient(Client):
             if (str(status.window_text()).strip() == "대기") or force_connect:
                 connect_btn.click_input()
             else:
-                raise VpnInUseError(f"{service_no}번째 서비스가 사용 중입니다.")
+                raise VpnInUseError(f"{service_no}번째 서비스가 사용 중입니다: '{ip_addr}'")
         except VpnInUseError as error:
             raise error
         except Exception:
@@ -340,8 +327,9 @@ class VpnClient(Client):
         self.wait_for_connection(ip_addr, **wait_options)
         return ip_addr
 
-    def disconnect(self, **wait_options: float):
-        window = self.wait_for_connection(**wait_options)
+    def disconnect(self, timeout: float = 30., interval: float = 0.25, after: float = 0.5, **kwargs):
+        start_time = time.perf_counter()
+        window = self.wait_for_connection(str(), timeout, interval, after)
         try:
             action_btn: ButtonWrapper = window.descendants(control_type="Button", title="연결끊기")[0]
             action_btn.click_input()
@@ -349,8 +337,11 @@ class VpnClient(Client):
             raise ElementNotFoundError("연결끊기 버튼이 존재하지 않습니다.")
 
         try:
-            confirm_btn: ButtonWrapper = window.descendants(control_type="Button", title="예(Y)")[0]
-            confirm_btn.click_input()
+            while (time.perf_counter() - start_time) < timeout:
+                if (buttons := window.descendants(control_type="Button", title="예(Y)")):
+                    confirm_btn: ButtonWrapper = buttons[0]
+                    return confirm_btn.click_input()
+                time.sleep(interval)
         except Exception:
             raise ElementNotFoundError("VPN 접속 해제 확인창이 존재하지 않습니다.")
 
@@ -359,15 +350,15 @@ class VpnClient(Client):
             ip_addr: str = str(),
             timeout: float = 30.,
             interval: float = 0.25,
-            wait_after: float | None = 0.5,
+            after: float = 0.5,
             **kwargs
         ) -> UIAWrapper:
         start_time = time.perf_counter()
         error_msg = "VPN이 연결되지 않았습니다."
 
         window = self.wait_window_open(self.title_patterns.connected, timeout, interval, error_msg)
-        if wait_after:
-            time.sleep(wait_after)
+        if after:
+            time.sleep(after)
         window.set_focus()
 
         while (time.perf_counter() - start_time) < timeout:
@@ -389,17 +380,14 @@ class VpnClient(Client):
 
     def search_and_connect(
             self,
+            ip_addr: str,
             service_name: str,
-            ip_addr: str = str(),
-            subnet: str = str(),
-            service_no: int = 1,
             force_connect: bool = False,
             **wait_options: float
         ) -> IpAddress:
-        if ip_addr:
-            self.search_ip_addr(ip_addr, **wait_options)
+        self.search_ip_addr(ip_addr, **wait_options)
         try:
-            return self.connect(service_name, service_no, subnet, force_connect, **wait_options)
+            return self.connect(service_name, force_connect=force_connect, **wait_options)
         except VpnFailedError:
             self.disconnect(**wait_options)
             return None

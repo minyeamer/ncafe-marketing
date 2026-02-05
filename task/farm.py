@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 from core.browser import BrowserController
-from core.login import login
-from core.action import goto_cafe_home, goto_cafe, goto_menu
+
+from core.login import login, NaverLoginError
+from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
+
+from core.action import goto_cafe_home, goto_cafe, goto_menu, CafeNotFound
 from core.action import goto_article, explore_articles
 from core.action import reload_articles, next_articles, go_back
 from core.action import read_article_and_write_comment, read_full_article
 from core.action import like_article, write_article
 from core.action import read_my_articles, open_info, close_info, read_action_log
+
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 
 from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
 from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
+from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
 
 from utils.common import AttrDict, Delay, wait, print_json
 from utils.timer import ActionTimer
 
-from typing import get_type_hints, TypeVar, TypedDict, TYPE_CHECKING
+from typing import get_type_hints, Literal, TypeVar, TypedDict, TYPE_CHECKING
 from collections import defaultdict, deque
 import datetime as dt
 import json
@@ -28,8 +33,13 @@ import sys
 import traceback
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Literal
+    from typing import Any, Callable
     from core.action import ArticleId, ArticleInfo, Comment, NewArticle
+    from extensions.gsheets import WorksheetConnection
+
+class QuiteHours(TypedDict):
+    start: int
+    end: int
 
 
 SECRETS_ROOT = ".secrets"
@@ -50,16 +60,19 @@ def is_default(value: Any) -> bool:
 class MaxLoopExceeded(RuntimeError):
     ...
 
+class QuietHoursError(RuntimeError):
+    ...
+
 
 ###################################################################
 ####################### Task Config - Farmer ######################
 ###################################################################
 
 class Config(TypedDict):
+    row_no: int
     userid: str
     passwd: str
     ip_addr: str
-    enabled: bool
     cafe_name: str
     menu_name: str
     visit_delay: int
@@ -100,6 +113,7 @@ class ConfigWrapper(AttrDict):
 
     def __init__(self, config: Config = dict(), **kwargs):
         super().__init__()
+        self.row_no = config["row_no"]
         self.userid = config["userid"]
         self.passwd = config["passwd"]
         self.ip_addr = config["ip_addr"]
@@ -112,21 +126,37 @@ class ConfigWrapper(AttrDict):
         counter: ActionCount = {key[:-len("_count")]: randint(config[key]) for key in config.keys() if key.endswith("_count")}
         self.counter, self.__counter = counter.copy(), counter.copy()
 
-        self.delay: ActionDelay = {key[:-len("_delay")]: config[key] for key in config.keys() if key.endswith("_delay")}
-        self.limit: ActionLimit = {key[:-len("_limit")]: config[key] for key in config.keys() if key.endswith("_limit")}
+        def safe_int(value: int | str) -> int:
+            try: return int(value)
+            except: return 0
+
+        self.delay: ActionDelay = {key[:-len("_delay")]: safe_int(config[key]) for key in config.keys() if key.endswith("_delay")}
+        self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
 
-    def reset_counter(self, key: Literal["read","comment","article","like"]):
-        self.counter[key] = self.__counter.get(key, 0)
-
-    def sub_counter(self, key: Literal["read","comment","article","like"]):
-        self.counter[key] = self.counter[key] - 1
-
-    def zero_counter(self, key: Literal["read","comment","article","like"]):
-        self.counter[key] = 0
+    def has_next_action(self) -> bool:
+        return ((self.counter["comment"] > 0) or (self.counter["like"] > 0) or ((self.counter["article"] > 0)))
 
     def calc_counter(self, key: Literal["read","comment","article","like"]) -> int:
         return self.__counter.get(key, 0) - self.counter.get(key, 0)
+
+    def reset_counter(self, key: Literal["all","read","comment","article","like"]):
+        if key == "all":
+            self.counter[key] = {key: self.__counter.get(key, 0) for key in self.counter.keys()}
+        else:
+            self.counter[key] = self.__counter.get(key, 0)
+
+    def sub_counter(self, key: Literal["all","read","comment","article","like"]):
+        if key == "all":
+            self.counter[key] = {key: (self.counter[key] - 1) for key in self.counter.keys()}
+        else:
+            self.counter[key] = self.counter[key] - 1
+
+    def zero_counter(self, key: Literal["all","read","comment","article","like"]):
+        if key == "all":
+            self.counter[key] = {key: 0 for key in self.counter.keys()}
+        else:
+            self.counter[key] = 0
 
     def get_left_keys(self) -> list[str]:
         return [key for key, count in self.counter.items() if count > 0]
@@ -144,7 +174,9 @@ class ActionThreshold(AttrDict):
 ######################## Task Log - Farmer ########################
 ###################################################################
 
+Index = TypeVar("Index", bound=int)
 UserId = TypeVar("UserId", bound=str)
+StopTask = TypeVar("StopTask", bound=bool)
 
 class ArticleActivity(TypedDict):
     title: str
@@ -155,16 +187,23 @@ class ArticleActivity(TypedDict):
     like_this: bool
 
 
+ErrorFlag = Literal[
+    "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류",
+    "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
+    "가입카페 확인 불가", "반복 횟수 초과", "금지 시간대", "브라우저 조작 오류"]
+
 class ErrorLog(TypedDict):
     type: str
+    message: str
     exc_info: str
+    flag: ErrorFlag | None
 
 
 class TaskLog(AttrDict):
 
     def __init__(self):
-        self.time_on_cafe: float | None = None
         self.last_active_ts: dt.datetime | None = None
+        self.time_on_cafe: float | None = None
         self.visit_count: int | None = None
         self.article_count: int | None = None
         self.comment_count: int | None = None
@@ -172,6 +211,7 @@ class TaskLog(AttrDict):
         self.read_articles: list[ArticleActivity] = list()
         self.my_articles: deque[ArticleInfo] = deque()
         self.written_articles: list[NewArticle] = list()
+        self.total_steps: int = 0
         self.error: ErrorLog | None = None
 
     def to_json(self, ellipsis_list: bool = False) -> dict:
@@ -188,6 +228,26 @@ class TaskLog(AttrDict):
         return dict(map(serialize, self.items()))
 
 
+class LogTableRow(TypedDict):
+    row_no: int
+    userid: str
+    cafe_name: str
+    menu_name: str
+    ip_addr: str
+    last_active_ts: dt.datetime
+    time_on_cafe: float
+    visit_count: int
+    article_count: int
+    comment_count: int
+    read_ids: str
+    read_articles: int
+    new_article_count: int
+    new_comment_count: int
+    new_like_count: int
+    total_steps: int
+    error_flag: ErrorFlag
+
+
 ###################################################################
 ###################### Task Executor - Farmer #####################
 ###################################################################
@@ -196,9 +256,7 @@ class Farmer(BrowserController):
 
     def __init__(
             self,
-            sheet_key: str,
-            sheet_name: str,
-            account: ServiceAccount | Literal[":default:"] = ":default:",
+            configs: WorksheetConnection,
             openai_key:  str | Path | Literal[":default:"] = ":default:",
             device: str = str(),
             mobile: bool = True,
@@ -207,35 +265,44 @@ class Farmer(BrowserController):
             goto_delay: Delay = (1, 3),
             reload_delay: Delay = (10, 12),
             upload_delay: Delay = (2, 4),
+            quiet_hours: QuiteHours = dict(),
             comment_threshold: float = 0.3,
             like_threshold: float = 0.4,
             vpn_config: VpnConfig = dict(),
+            write_config: WorksheetConnection = dict(),
+            **kwargs
         ):
         super().__init__(device, mobile, headless, action_delay, goto_delay, reload_delay, upload_delay)
-        self.credentials = ServiceAccount(DEFAULTS["account"] if is_default(account) else account)
-        self.configs = self.read_configs_from_gsheets(sheet_key, sheet_name)
-        self.threshold = ActionThreshold(comment_threshold, like_threshold)
-        self.index = 0
-        self.__logs: dict[UserId, TaskLog] = defaultdict(TaskLog)
-        self.__timers: dict[UserId, ActionTimer] = defaultdict(ActionTimer)
-        self.set_vpn_client(vpn_config)
+
+        self.quiet_hours = quiet_hours
+        self.check_quiet_hours()
+
+        self.validate_worksheet_connection(configs, empty=False)
+        self.configs = self.read_configs_from_gsheets(**configs)
+
         set_api_key(DEFAULTS["openai_key"] if is_default(openai_key) else openai_key)
+
+        self.index: Index = 0
+        self.logs: dict[Index, TaskLog] = defaultdict(TaskLog)
+        self.timers: dict[Index, ActionTimer] = defaultdict(ActionTimer)
+        self.threshold = ActionThreshold(comment_threshold, like_threshold)
+
+        self.set_vpn_client(vpn_config)
+
+        self.validate_worksheet_connection(write_config, empty=True)
+        self.write_config = write_config
 
     @property
     def config(self) -> ConfigWrapper:
         return self.configs[self.index]
 
     @property
-    def userid(self) -> str:
-        return self.config.userid
-
-    @property
     def log(self) -> TaskLog:
-        return self.__logs[self.userid]
+        return self.logs[self.index]
 
     @property
     def timer(self) -> ActionTimer:
-        return self.__timers[self.userid]
+        return self.timers[self.index]
 
     @property
     def delays2(self) -> dict[str,Delay]:
@@ -245,92 +312,144 @@ class Farmer(BrowserController):
     def delays3(self) -> dict[str,Delay]:
         return self.delays.get_delays(["action", "goto", "upload"])
 
-    def read_configs_from_gsheets(self, key: str, sheet: str) -> list[ConfigWrapper]:
-        client = WorksheetClient(self.credentials, key, sheet)
-        str_keys = [i for i, type in enumerate(get_type_hints(Config).values(), start=1) if type == str]
-        records = client.get_all_records(head=2, numericise_ignore=str_keys)
-        return [ConfigWrapper(record) for record in records if record["enabled"]]
+    @property
+    def browser_state(self) -> Path | None:
+        states_root = Path(STATES_ROOT)
+        states_root.mkdir(parents=True, exist_ok=True)
+        return states_root / (self.config.userid + ".json")
+
+    def check_quiet_hours(self):
+        if self.quiet_hours:
+            hour = dt.datetime.now().hour
+            if self.quiet_hours["start"] <= hour <= self.quiet_hours["end"]:
+                raise QuietHoursError("실행 금지 시간대입니다.")
 
     ########################### Entry Point ###########################
 
     def start(
             self,
-            with_state: bool = True,
-            max_steps: int = 100,
+            max_task_loop: int = 10,
+            max_action_loop: int = 100,
             reload_start_step: int = 10,
             num_my_articles: int = 10,
+            with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             save_log: bool = True,
             **kwargs
         ):
+        self.check_quiet_hours()
+
         if self.vpn_enabled:
             self.vpn.start_process(self.vpn_config.force_restart)
             if not self.vpn.try_login(**self.vpn_config.login):
                 self.vpn.restart_service(**self.vpn_config.login)
 
+        stop_task: StopTask = None
+
+        for _ in range(max_task_loop):
+            if stop_task or (not any([config.has_next_action() for config in self.configs])):
+                break
+
+            if isinstance(stop_task, bool):
+                comment_min_delay = self.min_action_delay("comment")
+                article_min_delay = self.min_action_delay("article")
+                if (min_delay := min(comment_min_delay, article_min_delay)):
+                    self.print_loop("wait", verbose, seconds=min_delay)
+                    wait(min_delay)
+
+            stop_task = self.task_loop(
+                max_action_loop, reload_start_step, num_my_articles, with_state, verbose, dry_run, save_log)
+
+            if self.write_config:
+                try:
+                    self.write_log_table_to_gsheets(**self.write_config)
+                except:
+                    pass
+
+        if self.vpn_enabled:
+            self.vpn.terminate_process()
+
+    def min_action_delay(self, key: Literal["comment","article"]) -> float:
+        delays = [max(0., self.configs[index].delay[key] - secs)
+            for index, timer in self.timers.items()
+                if isinstance(secs := timer.get_elapsed_time(key), float)]
+        return min(delays) if delays else 0.
+
+    ############################# <start> #############################
+    ############################ Task Loop ############################
+
+    def task_loop(
+            self,
+            max_steps: int = 100,
+            reload_start_step: int = 10,
+            num_my_articles: int = 10,
+            with_state: bool = True,
+            verbose: int | str | Path = 0,
+            dry_run: bool = False,
+            save_log: bool = True,
+        ) -> StopTask:
+        stop_task, flag = False, None
+
         for i in range(len(self.configs)):
             self.index = i
 
-            if with_state:
-                states_root = Path(STATES_ROOT)
-                states_root.mkdir(parents=True, exist_ok=True)
-                kwargs["state"] = states_root / (self.userid + ".json")
-                has_state = os.path.exists(str(kwargs["state"]))
-            else:
-                has_state = False
+            if stop_task:
+                self.print_loop("break", verbose)
+                self.config.zero_counter("all")
+                continue
 
-            print_json(dict(
-                task_step = "loop_start",
-                index = self.index,
-                userid = self.userid,
-                config = self.config,
-                state = str(kwargs.get("state"))), verbose)
+            state = self.browser_state if with_state else None
+            self.print_loop("start", verbose, state=state)
 
             try:
+                self.check_quiet_hours()
                 vpn_connected = False
-                if self.vpn_enabled and self.config.ip_addr:
-                    vpn_connected = bool(self.vpn.search_and_connect(**self.vpn_config.search_and_connect))
+                if self.vpn_enabled and (ip_addr := self.config.ip_addr):
+                    self.vpn.try_login(**self.vpn_config.login)
+                    vpn_connected = bool(self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect))
 
                 try:
-                    args = (has_state, max_steps, reload_start_step, num_my_articles, verbose, dry_run)
-                    self.do_actions(*args, **kwargs)
+                    self.do_actions(max_steps, reload_start_step, num_my_articles, verbose, dry_run, state=state)
+                    self.log.error = None
                 finally:
                     if vpn_connected:
                         self.vpn.disconnect(**self.vpn_config.wait_options)
-            except VpnRuntimeError as error:
-                self.vpn.restart_service(**self.vpn_config.login)
-                exc_info = '\n'.join(traceback.format_exception(*sys.exc_info()))
-                self.log.error = dict(type=str(type(error).__name__), exc_info=exc_info)
-            except Exception as exception:
-                exc_info = '\n'.join(traceback.format_exception(*sys.exc_info()))
-                self.log.error = dict(type=str(type(exception).__name__), exc_info=exc_info)
+                        self.vpn.logout(**self.vpn_config.wait_options)
+            except Exception as error:
+                self.log.error = dict(
+                    type = str(type(error).__name__),
+                    message = self.get_error_msg(error),
+                    exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
+                    flag = (flag := self.get_error_flag(error)),
+                )
 
-            self.log.time_on_cafe = self.timer.end_timer("visit", 3)
             self.log.last_active_ts = dt.datetime.now()
-
-            print_json(dict(
-                task_step = "loop_end",
-                index = self.index,
-                userid = self.userid,
-                log = self.log.to_json(ellipsis_list=((not isinstance(verbose, int)) or (verbose < 3)))), verbose)
+            self.log.time_on_cafe = self.timer.end_timer("visit", 3)
+            self.print_loop("end", verbose)
 
             if save_log:
                 self.save_log_json()
 
+            stop_task = self.handle_error_flag(flag)
+
+        return stop_task
+
     @BrowserController.with_browser
     def do_actions(
             self,
-            has_state: bool = True,
             max_steps: int = 100,
             reload_start_step: int = 10,
             num_my_articles: int = 10,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
-            **kwargs
+            *,
+            state: str | Path | None = None,
         ):
-        self.navigate_to_menu(has_state)
-        if not self.check_member_level():
+        self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
+
+        qualified_before = self.check_member_level()
+        if not qualified_before:
             self.config.zero_counter("article")
 
         if self.need_my_articles((n := num_my_articles)):
@@ -338,16 +457,12 @@ class Farmer(BrowserController):
 
         self.action_loop(max_steps, reload_start_step, verbose, dry_run)
 
-        if self.check_member_level():
+        qualified_after = self.check_member_level()
+        if (not qualified_before) and qualified_after:
             self.config.reset_counter("article")
 
-    def save_log_json(self):
-        logs_path = Path(LOGS_ROOT) / self.userid
-        logs_path.mkdir(parents=True, exist_ok=True)
-        with open(logs_path / (dt.datetime.now().strftime("%Y%m%d%H%M%S")+".json"), 'w', encoding="utf-8") as file:
-            json.dump(self.log.to_json(), file, indent=2, ensure_ascii=False, default=str)
-
-    ############################ Loop Start ###########################
+    ############################# <start> #############################
+    ########################### Action Loop ###########################
 
     def action_loop(
             self,
@@ -358,20 +473,23 @@ class Farmer(BrowserController):
         ):
         root = os.path.join(PROMPTS_ROOT, self.config.cafe_name, self.config.menu_name)
         prompt = lambda agent: dict(markdown_path=os.path.join(root, f"{agent}.md"))
-        articles, step, unselected_steps = list(), 0, 0
+        articles, step, unselected_steps = list(), 1, 0
 
         while self.has_next_action():
+            self.check_quiet_hours()
+
             if step >= max_steps:
-                raise MaxLoopExceeded(f"[{self.userid}] 최대 루프 횟수에 도달했습니다.")
+                raise MaxLoopExceeded(f"[{self.index}] 최대 루프 횟수에 도달했습니다.")
             elif step > reload_start_step:
                 wait(self.delays.reload)
                 reload_articles(self.page, self.delays.goto)
-            elif step > 1:
+            elif step > 2:
                 next_articles(self.page, self.delays.action)
-            step += 1
 
             selected = explore_articles(self.page, self.log.read_ids, prompt("select_articles"), verbose) # Action 3 + Agent 1
             for params in selected:
+                self.check_quiet_hours()
+
                 if goto_article(self.page, params["articleid"], self.delays.goto): # Action 4
                     try:
                         activity = self.read_and_react(prompt, verbose, dry_run)
@@ -384,19 +502,16 @@ class Farmer(BrowserController):
                     new_article = self.write_article(articles, prompt, verbose, dry_run)
                     self.log.written_articles.append(new_article)
 
-            print_json(dict(
-                task_step = f"loop_{step}",
-                index = self.index,
-                userid = self.userid,
-                read_ids = ','.join([param["articleid"] for param in selected]),
-                counter = self.config.counter,
-                timer = self.timer.get_all_elapsed_times(ndigits=3)), verbose)
+            read_ids = ','.join([param["articleid"] for param in selected])
+            self.print_loop(step, verbose, read_ids=read_ids)
 
-            if (step > 10) and (not selected):
-                unselected_steps += 1
-                wait(5 * (unselected_steps * 0.5))
+            if (step > reload_start_step) and (not selected):
+                wait(max(10, (unselected_steps := unselected_steps + 1)))
             else:
                 unselected_steps = 0
+
+            step += 1
+            self.log.total_steps += 1
 
     ########################### Action 0+1+2 ##########################
 
@@ -404,7 +519,7 @@ class Farmer(BrowserController):
         if has_state:
             goto_cafe_home(self.page, self.mobile, **self.delays2) # Action 0
         else:
-            login(self.page, self.userid, self.config.passwd, mobile=self.mobile, **self.delays2)
+            login(self.page, self.config.userid, self.config.passwd, "cafe", self.mobile, **self.delays2)
         wait(self.delays.goto)
 
         goto_cafe(self.page, self.config.cafe_name, self.delays.goto), wait(self.delays.goto) # Action 1
@@ -415,7 +530,7 @@ class Farmer(BrowserController):
 
     def check_member_level(self) -> bool:
         qualified = True
-        action_log = read_action_log(self.page)
+        action_log = read_action_log(self.page, **self.delays2)
 
         if "방문" in action_log:
             self.log.visit_count = action_log["방문"]
@@ -442,8 +557,9 @@ class Farmer(BrowserController):
     ######################### Action Condition ########################
 
     def has_next_action(self) -> bool:
-        return ((self.config.counter["comment"] > 0)
-            or (self.config.counter["like"] > 0)
+        return ((self.config.counter["like"] > 0)
+            or ((self.config.counter["comment"] > 0)
+                and self.timer.gte("comment", self.config.delay["comment"]))
             or ((self.config.counter["article"] > 0)
                 and self.timer.gte("article", self.config.delay["article"])))
 
@@ -539,7 +655,180 @@ class Farmer(BrowserController):
             self.log.my_articles.appendleft(info)
         return new
 
-    ############################# Loop End ############################
+    ########################### Action Loop ###########################
+    ############################## <end> ##############################
+
+    ############################ Task Loop ############################
+    ############################## <end> ##############################
+
+    ########################### Handle Error ##########################
+
+    def get_error_msg(self, error: Exception) -> str:
+        try:
+            return str(error) or None
+        except:
+            return None
+
+    def get_error_flag(self, error: Exception) -> ErrorFlag | None:
+        if isinstance(error, VpnRuntimeError):
+            if isinstance(error, VpnLoginFailedError):
+                return "VPN 로그인 오류"
+            elif isinstance(error, VpnInUseError):
+                return "VPN 사용중"
+            elif isinstance(error, VpnFailedError):
+                return "VPN 접속 오류"
+            else:
+                return "VPN 오류"
+        elif isinstance(error, NaverLoginError):
+            if isinstance(error, NaverLoginFailedError):
+                return "네이버 계정 불일치"
+            elif isinstance(error, WarningAccountError):
+                return "네이버 계정 보호조치"
+            elif isinstance(error, ReCaptchaRequiredError):
+                return "네이버 CAPTCHA 발생"
+            else:
+                return "네이버 로그인 오류"
+        elif isinstance(error, CafeNotFound):
+            return "가입카페 확인 불가"
+        elif isinstance(error, MaxLoopExceeded):
+            return "반복 횟수 초과"
+        elif isinstance(error, QuietHoursError):
+            return "금지 시간대"
+        elif isinstance(error, TimeoutError):
+            return "브라우저 조작 오류"
+        return None
+
+    def handle_error_flag(self, flag: ErrorFlag) -> StopTask:
+        if not isinstance(flag, str):
+            return False
+        elif flag == "VPN 사용중":
+            try:
+                self.vpn.restart_service(**self.vpn_config.login)
+                self.config.zero_counter("all")
+            except:
+                return True
+        elif flag.startswith("네이버") or (flag == "가입카페 확인 불가"):
+            userid = self.config.userid
+            for config in self.configs:
+                if config.userid == userid:
+                    config.zero_counter("all")
+            if flag.startswith("네이버") and (state := self.browser_state) and state.exists():
+                os.remove(str(state))
+        return (flag in {"VPN 로그인 오류", "VPN 오류", "금지 시간대"})
+
+    ############################# Task Log ############################
+
+    def print_loop(
+            self,
+            step: int | Literal["start","end","break","wait"],
+            verbose: int | str | Path = 0,
+            **kwargs
+        ):
+        common = lambda: dict(
+            index = self.index,
+            userid = self.config.userid,
+            cafe_name = self.config.cafe_name,
+            menu_name = self.config.menu_name,
+        )
+
+        if isinstance(step, int):
+            body = dict(
+                task_step = f"loop_{step}",
+                **common(),
+                read_ids = str(read_ids) if (read_ids := kwargs.get("read_ids")) else None,
+                counter = self.config.counter,
+                timer = self.timer.get_all_elapsed_times(ndigits=3),
+            )
+        elif step == "start":
+            body = dict(
+                task_step = "loop_start",
+                **common(),
+                config = self.config,
+                state = str(state) if (state := kwargs.get("state")) else None,
+            )
+        elif step == "wait":
+            body = dict(
+                task_step = "loop_wait",
+                seconds = kwargs.get("seconds"),
+            )
+        else:
+            body = dict(
+                task_step = f"loop_{step}",
+                **common(),
+                log = self.log.to_json(ellipsis_list=((not isinstance(verbose, int)) or (verbose < 3))),
+            )
+
+        print_json(body, verbose)
+
+    def save_log_json(self):
+        logs_path = Path(LOGS_ROOT) / self.config.userid
+        logs_path.mkdir(parents=True, exist_ok=True)
+        with open(logs_path / (dt.datetime.now().strftime("%Y%m%d%H%M%S")+".json"), 'w', encoding="utf-8") as file:
+            json.dump(self.log.to_json(), file, indent=2, ensure_ascii=False, default=str)
+
+    ########################## Read and Write #########################
+
+    def read_configs_from_gsheets(
+            self,
+            key: str,
+            sheet: str,
+            account: str | Path | Literal[":default:"] = ":default:",
+            head: int = 1,
+        ) -> list[ConfigWrapper]:
+        client = WorksheetClient(self._get_credentials(account), key, sheet, head)
+        str_keys = [i for i, type in enumerate(get_type_hints(Config).values(), start=1) if type == str]
+        records = client.get_all_records(numericise_ignore=str_keys)
+        return [ConfigWrapper(record) for record in records if isinstance(record["row_no"], int)]
+
+    def write_log_table_to_gsheets(
+            self,
+            key: str,
+            sheet: str,
+            account: str | Path | Literal[":default:"] = ":default:",
+            head: int = 1,
+        ):
+        client = WorksheetClient(self._get_credentials(account), key, sheet, head)
+        records = self.make_log_table()
+        client.overwrite_worksheet(records)
+
+    def make_log_table(self) -> list[LogTableRow]:
+        rows = list()
+        for index, log in self.logs.items():
+            config = self.configs[index]
+            rows.append(dict(
+                row_no = config.row_no,
+                userid = config.userid,
+                cafe_name = config.cafe_name,
+                menu_name = config.menu_name,
+                ip_addr = config.ip_addr,
+                last_active_ts = log.last_active_ts,
+                time_on_cafe = log.time_on_cafe,
+                visit_count = log.visit_count,
+                article_count = log.article_count,
+                comment_count = log.comment_count,
+                read_ids = ','.join(sorted(log.read_ids)) or None,
+                read_articles = len(log.read_articles),
+                new_article_count = len(log.written_articles),
+                new_comment_count = len([1 for activity in log.read_articles if activity["written_comment"]]),
+                new_like_count = len([1 for activity in log.read_articles if activity["like_this"]]),
+                total_steps = log.total_steps,
+                error_flag = log.error["flag"] if log.error else None,
+            ))
+        return rows
+
+    def validate_worksheet_connection(self, conn: WorksheetConnection, empty: bool = False) -> bool:
+        if not isinstance(conn, dict):
+            raise TypeError("구글시트 연결 정보가 올바른 타입이 아닙니다.")
+        elif empty and (not conn):
+            return True
+        elif not (conn.get("key") and conn.get("sheet")):
+            raise KeyError("구글시트 연결 정보에 'key' 또는 'sheet' 값이 없습니다.")
+        return True
+
+    def _get_credentials(self, account: str | Path | Literal[":default:"] = ":default:",) -> ServiceAccount:
+        return ServiceAccount(DEFAULTS["account"] if is_default(account) else str(account))
+
+    ########################## VPN Extension ##########################
 
     @property
     def vpn(self) -> VpnClient:

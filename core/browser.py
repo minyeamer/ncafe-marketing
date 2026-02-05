@@ -68,9 +68,11 @@ class BrowserState(AttrDict):
     def close_browser(self):
         self.__browser.close()
 
-    def new_context(self, device: str = str(), **kwargs):
+    def new_context(self, device: str = str(), state: str | Path | None = None, **kwargs):
         if device:
             kwargs.update(self.__playwright.devices[device])
+        if state and os.path.exists(str(state)):
+            kwargs.update(storage_state=state)
         self.__context = self.__browser.new_context(**kwargs)
 
     def new_page(self):
@@ -125,15 +127,12 @@ class BrowserController(AttrDict):
                     self.states.set_playwright(playwright)
                     self.states.launch_browser(headless=self.headless)
                     try:
-                        if state and os.path.exists(str(state)):
-                            self.states.new_context(self.device, storage_state=state)
-                        else:
-                            self.states.new_context(self.device)
+                        self.states.new_context(self.device, state)
                         self.states.new_page()
-                        return func(self, *args, **kwargs)
+                        return func(self, *args, state=state, **kwargs)
                     finally:
                         if state and self.context:
-                            self.context.storage_state(path=state)
+                            self.context.storage_state(path=str(state))
                         self.states.close_browser()
             finally:
                 self.reset_states()

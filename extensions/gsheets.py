@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from gspread import service_account_from_dict
 
-from typing import Callable, Sequence, TYPE_CHECKING
+from typing import Callable, Sequence, TypedDict, TYPE_CHECKING
 import datetime as dt
 import json
 import re
@@ -108,13 +108,27 @@ def to_csv(
 ######################### Worksheet Client ########################
 ###################################################################
 
+class WorksheetConnection(TypedDict):
+    account: str | Path
+    key: str
+    sheet: str
+    head: int
+
+
 class WorksheetClient:
-    def __init__(self, account: ServiceAccount, key: str | None = None, sheet: str | None = None):
+    def __init__(
+            self,
+            account: ServiceAccount,
+            key: str | None = None,
+            sheet: str | None = None,
+            head: int = 1,
+        ):
         self.set_client(account)
         if key is not None:
             self.set_spreadsheet(key)
         if sheet is not None:
             self.set_worksheet(sheet)
+        self.head = head
 
     def get_client(self) -> ServiceClient:
         return self.__client
@@ -181,7 +195,6 @@ class WorksheetClient:
 
     def get_all_records(
             self,
-            head: int = 1,
             expected_headers: Any | None = None,
             filter_headers: _KT | list[_KT] | None = None,
             value_render_option: Any | None = None,
@@ -192,7 +205,7 @@ class WorksheetClient:
             convert_dtypes: bool = True,
         ) -> list[dict]:
         records = self.worksheet.get_all_records(
-            head, expected_headers, value_render_option, default_blank,
+            self.head, expected_headers, value_render_option, default_blank,
             self._numericise_ignore(numericise_ignore), allow_underscores_in_numeric_literals, empty2zero)
         if convert_dtypes:
             return worksheet2py(records, filter_headers)
@@ -237,7 +250,7 @@ class WorksheetClient:
         if match_header:
             table = self._match_table_header(table)
         if not include_header:
-            table = table[1:]
+            table = table[self.head:]
         self.clear(include_header)
         return self.worksheet.update(table, range_name=("A1" if include_header else "A2"))
 

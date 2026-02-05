@@ -41,6 +41,10 @@ class Contents(TypedDict):
     read_done: bool
 
 
+class CafeNotFound(RuntimeError):
+    ...
+
+
 def cur_time() -> str:
     return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
 
@@ -124,8 +128,23 @@ def goto_cafe(
         goto_delay: Delay = (1, 3),
     ):
     """## Action 1"""
-    page.tap(f'.mycafe_flicking:not([style="display: none;"]) a:has-text("{cafe_name}")')
-    wait(goto_delay)
+    cafe_li = f'.mycafe_flicking:not([style="display: none;"]) a:has-text("{cafe_name}")'
+    if page.locator(cafe_li).count() > 0:
+        page.tap(cafe_li)
+        return wait(goto_delay)
+
+    my_cafe = '.area_flick_view a:has-text("내 카페")'
+    if page.locator(my_cafe).count() > 0:
+        page.tap(my_cafe), wait(goto_delay)
+        cafe_li = f'.cafe_info:has-text("{cafe_name}")'
+        if page.locator(cafe_li).count() > 0:
+            ranges = dict(
+                boundary = page.locator("body").first,
+                overlay = dict(top=page.locator(".HeaderWrap").first.bounding_box()["height"]))
+            safe_tap(page, cafe_li, **ranges)
+            return wait(goto_delay)
+
+    raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
 
 
 def go_back(page: Page, goto_delay: Delay = (1, 3)):
@@ -549,8 +568,8 @@ def close_info(page: Page, goto_delay: Delay = (1, 3)):
     page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
 
 
-def read_action_log(page: Page, action_delay: Delay = (0.3, 0.6)) -> dict[str,int]:
-    open_menu(page, action_delay)
+def read_action_log(page: Page, action_delay: Delay = (0.3, 0.6), goto_delay: Delay = (1, 3)) -> dict[str,int]:
+    open_menu(page, goto_delay)
     def safe_int(value: str) -> int:
         try: return int(value)
         except: return

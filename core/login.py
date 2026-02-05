@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 from playwright.sync_api import Page
-from core.action import goto_naver_main, goto_cafe_home
+from core.action import main_url, cafe_url, goto_naver_main, goto_cafe_home
 from utils.common import wait, Delay
 
 from typing import TYPE_CHECKING
+import time
 
 if TYPE_CHECKING:
     from typing import Literal
 
 
-class AuthenticateError(ValueError):
+class NaverLoginError(RuntimeError):
     ...
 
-class WarningAccountError(AuthenticateError):
+class NaverLoginFailedError(NaverLoginError):
     ...
 
-class ReCaptchaRequiredError(AuthenticateError):
+class WarningAccountError(NaverLoginError):
+    ...
+
+class ReCaptchaRequiredError(NaverLoginError):
     ...
 
 
@@ -33,12 +37,16 @@ def login(
     login_begin(page, referer, mobile, action_delay, goto_delay)
     login_action(page, userid, passwd, mobile, action_delay, goto_delay)
 
-    if page.locator("#divWarning").count() > 0:
-        raise WarningAccountError(f"[{userid}] 회원님의 아이디를 보호하고 있습니다.")
-    elif page.locator("#rcapt").count() > 0:
-        raise ReCaptchaRequiredError(f"[{userid}] 자동입력 방지 문자를 입력해주세요.")
-    else:
-        goto_cafe_home(page, mobile, action_delay, goto_delay) # Action 0
+    success_url = cafe_url(mobile) if referer == "cafe" else main_url(mobile)
+    if get_page_url(page) != success_url:
+        if page.locator("#error_message").count() > 0:
+            message = page.locator("#error_message").first.text_content().strip()
+            raise NaverLoginFailedError(message)
+        elif page.locator("#divWarning").count() > 0:
+            raise WarningAccountError("회원님의 아이디를 보호하고 있습니다.")
+        elif page.locator("#rcapt").count() > 0:
+            raise ReCaptchaRequiredError("자동입력 방지 문자를 입력해주세요.")
+    goto_cafe_home(page, mobile, action_delay, goto_delay) # Action 0
 
 
 def wander_around(page: Page, mobile: bool = True, goto_delay: Delay = (1, 3)):
@@ -94,3 +102,13 @@ def login_action(
         # if page.get_attribute("#smart_LEVEL", "value") == '1':
         #     safe_click(page, "#switch", position="center"), wait(action_delay) # IP보안
         page.click('button[type="submit"]'), wait(goto_delay)
+
+
+def get_page_url(page: Page, timeout: float = 5., interval: float = 0.25) -> str:
+    start_time = time.perf_counter()
+    while (time.perf_counter() - start_time) < timeout:
+        try:
+            page.evaluate("() => window.location.href")
+        except:
+            time.sleep(interval)
+    return str()
