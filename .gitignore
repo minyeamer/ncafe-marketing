@@ -28,6 +28,7 @@ share/python-wheels/
 MANIFEST
 build.sh
 dist.sh
+dist.bat
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

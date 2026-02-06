@@ -8,7 +8,7 @@ from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFa
 from core.action import goto_cafe_home, goto_cafe, goto_menu, CafeNotFound
 from core.action import goto_article, explore_articles
 from core.action import reload_articles, next_articles, go_back
-from core.action import read_article_and_write_comment, read_full_article
+from core.action import read_article, read_full_article, read_article_and_write_comment
 from core.action import like_article, write_article
 from core.action import read_my_articles, open_info, close_info, read_action_log
 
@@ -34,7 +34,7 @@ import sys
 import traceback
 
 if TYPE_CHECKING:
-    from typing import Any, Callable
+    from typing import Any
     from core.action import ArticleId, ArticleInfo, Comment, NewArticle
     from extensions.gsheets import WorksheetConnection
 
@@ -61,8 +61,17 @@ def is_default(value: Any) -> bool:
 class MaxLoopExceeded(RuntimeError):
     ...
 
+class PromptNotFoundError(RuntimeError):
+    ...
+
 class QuietHoursError(RuntimeError):
     ...
+
+
+class MaxRetries(TypedDict, total=False):
+    task_loop: int
+    action_loop: int
+    vpn_connect: int
 
 
 ###################################################################
@@ -76,7 +85,6 @@ class Config(TypedDict):
     ip_addr: str
     cafe_name: str
     menu_name: str
-    visit_delay: int
     read_count: str
     comment_count: str
     comment_delay: int
@@ -121,15 +129,15 @@ class ConfigWrapper(AttrDict):
         self.cafe_name = config["cafe_name"]
         self.menu_name = config["menu_name"]
 
-        def randint(value: str) -> int:
-            return random.randint(*map(int, value.split('~', 1))) if '~' in value else int(value)
-
-        counter: ActionCount = {key[:-len("_count")]: randint(config[key]) for key in config.keys() if key.endswith("_count")}
-        self.counter, self.__counter = counter.copy(), counter.copy()
-
         def safe_int(value: int | str) -> int:
             try: return int(value)
             except: return 0
+
+        def randint(value: str) -> int:
+            return random.randint(*map(safe_int, value.split('~', 1))) if '~' in str(value) else safe_int(value)
+
+        counter: ActionCount = {key[:-len("_count")]: randint(config[key]) for key in config.keys() if key.endswith("_count")}
+        self.counter, self.__counter = counter.copy(), counter.copy()
 
         self.delay: ActionDelay = {key[:-len("_delay")]: safe_int(config[key]) for key in config.keys() if key.endswith("_delay")}
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
@@ -141,7 +149,7 @@ class ConfigWrapper(AttrDict):
     @property
     def done(self) -> bool:
         if not self.__done:
-            self.__done = ((self.counter["comment"] > 0) or (self.counter["like"] > 0) or ((self.counter["article"] > 0)))
+            self.__done = ((self.counter["comment"] == 0) and (self.counter["like"] == 0) and ((self.counter["article"] == 0)))
             return self.__done
         else:
             return True
@@ -338,10 +346,11 @@ class Farmer(BrowserController):
 
     def start(
             self,
-            max_task_loop: int = 10,
-            max_action_loop: int = 100,
-            reload_start_step: int = 10,
+            max_retries: MaxRetries = dict(),
             num_my_articles: int = 10,
+            max_read_length: int = 500,
+            reload_start_step: int = 10,
+            wait_until_read: bool = True,
             task_delay: float = 5.,
             vpn_delay: float = 5.,
             with_state: bool = True,
@@ -359,8 +368,8 @@ class Farmer(BrowserController):
 
         stop_task: StopTask = None
 
-        for _ in range(max_task_loop):
-            if stop_task or (not any([config.done for config in self.configs])):
+        for _ in range(max_retries.get("task_loop") or 10):
+            if stop_task or all([config.done for config in self.configs]):
                 break
 
             if isinstance(stop_task, bool):
@@ -372,7 +381,8 @@ class Farmer(BrowserController):
                 wait(delay)
 
             stop_task = self.task_loop(
-                max_action_loop, reload_start_step, num_my_articles, vpn_delay, with_state, verbose, dry_run, save_log)
+                max_retries, num_my_articles, max_read_length, reload_start_step,
+                wait_until_read, vpn_delay, with_state, verbose, dry_run, save_log)
 
             if self.write_config:
                 try:
@@ -394,9 +404,11 @@ class Farmer(BrowserController):
 
     def task_loop(
             self,
-            max_action_loop: int = 100,
-            reload_start_step: int = 10,
+            max_retries: MaxRetries = dict(),
             num_my_articles: int = 10,
+            max_read_length: int = 500,
+            reload_start_step: int = 10,
+            wait_until_read: bool = True,
             vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
@@ -404,6 +416,8 @@ class Farmer(BrowserController):
             save_log: bool = True,
         ) -> StopTask:
         stop_task, flag = False, None
+        max_steps = max_retries.get("action_loop") or 100
+        max_vpn_retries = max_retries.get("vpn_connect") or 5
 
         for i in range(len(self.configs)):
             self.index = i
@@ -423,11 +437,12 @@ class Farmer(BrowserController):
                 self.check_quiet_hours()
 
                 if self.vpn_enabled and (ip_addr := self.config.ip_addr):
-                    self.vpn.try_login(**self.vpn_config.login)
-                    vpn_connected = bool(self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect))
+                    vpn_connected = self.ensure_vpn_connected(ip_addr, max_vpn_retries, vpn_delay)
 
                 try:
-                    self.do_actions(max_action_loop, reload_start_step, num_my_articles, verbose, dry_run, state=state)
+                    self.do_actions(
+                        max_steps, num_my_articles, max_read_length, reload_start_step,
+                        wait_until_read, verbose, dry_run, state=state)
                     self.log.error = None
                 finally:
                     if vpn_connected:
@@ -458,9 +473,11 @@ class Farmer(BrowserController):
     @BrowserController.with_browser
     def do_actions(
             self,
-            max_action_loop: int = 100,
-            reload_start_step: int = 10,
+            max_steps: int = 100,
             num_my_articles: int = 10,
+            max_read_length: int = 500,
+            reload_start_step: int = 10,
+            wait_until_read: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             *,
@@ -477,7 +494,7 @@ class Farmer(BrowserController):
             self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
 
         try:
-            self.action_loop(max_action_loop, reload_start_step, verbose, dry_run)
+            self.action_loop(max_steps, max_read_length, reload_start_step, wait_until_read, verbose, dry_run)
             self.config.qualified = self.check_member_level()
         finally:
             if not qualified:
@@ -488,16 +505,16 @@ class Farmer(BrowserController):
 
     def action_loop(
             self,
-            max_action_loop: int = 100,
+            max_steps: int = 100,
+            max_read_length: int = 500,
             reload_start_step: int = 10,
+            wait_until_read: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
         ):
-        root = os.path.join(PROMPTS_ROOT, self.config.cafe_name, self.config.menu_name)
-        prompt = lambda agent: dict(markdown_path=os.path.join(root, f"{agent}.md"))
         articles, step, unselected_steps = list(), 1, 0
 
-        for step in range(max_action_loop, start=1):
+        for step in range(1, max_steps+1):
             self.check_quiet_hours()
 
             if not self.has_next_action():
@@ -509,20 +526,22 @@ class Farmer(BrowserController):
             elif step > 2:
                 next_articles(self.page, self.delays.action)
 
-            selected = explore_articles(self.page, self.log.read_ids, prompt("select_articles"), verbose) # Action 3 + Agent 1
+            selected = explore_articles(
+                self.page, self.log.read_ids, self.get_prompt("select_articles"), verbose) # Action 3 + Agent 1
             for params in selected:
                 self.check_quiet_hours()
 
                 if goto_article(self.page, params["articleid"], self.delays.goto): # Action 4
                     try:
-                        activity = self.read_and_react(prompt, verbose, dry_run)
-                        articles.append({key: activity[key] for key in ["title","contents","comments","created_at"]})
-                        self.log.read_articles.append(activity)
+                        activity = self.read_and_react(max_read_length, wait_until_read, verbose, dry_run)
+                        if activity:
+                            articles.append({key: activity[key] for key in ["title","contents","comments","created_at"]})
+                            self.log.read_articles.append(activity)
                     finally:
                         go_back(self.page, self.delays.goto)
 
                 if self.is_article_allowed():
-                    new_article = self.write_article(articles, prompt, verbose, dry_run)
+                    new_article = self.write_article(articles, verbose, dry_run)
                     self.log.written_articles.append(new_article)
 
             read_ids = ','.join([param["articleid"] for param in selected])
@@ -534,6 +553,15 @@ class Farmer(BrowserController):
                 unselected_steps = 0
 
             self.log.total_steps += 1
+
+    def get_prompt(self, file_name: str) -> dict:
+        cafe_root = os.path.join(PROMPTS_ROOT, self.config.cafe_name)
+        cafe_menu_root = os.path.join(cafe_root, self.config.menu_name)
+        for root in [cafe_menu_root, cafe_root, PROMPTS_ROOT]:
+            markdown_path = os.path.join(root, f"{file_name}.md")
+            if os.path.exists(markdown_path):
+                return dict(markdown_path=markdown_path)
+        raise PromptNotFoundError(f"'{file_name}' 프롬프트가 존재하지 않습니다.")
 
     ########################### Action 0+1+2 ##########################
 
@@ -608,17 +636,23 @@ class Farmer(BrowserController):
 
     def read_and_react(
             self,
-            prompt: Callable,
+            max_read_length: int = 500,
+            wait_until_read: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
-        ) -> ArticleActivity:
-        comment: Comment = None
+        ) -> ArticleActivity | None:
+        word_count = read_article(self.page, wait_until_read=False, contents_only=True)["word_count"]
+        if word_count > max_read_length:
+            return None
+        else:
+            comment: Comment = None
+            common = dict(page=self.page, wait_until_read=wait_until_read, verbose=verbose)
+
         if self.is_comment_allowed():
             article, comment = read_article_and_write_comment(
-                page = self.page,
+                **common,
                 comment_limit = (self.config.length["comment"] or "20자 이내"),
-                prompt = prompt("create_comment"),
-                verbose = verbose,
+                prompt = self.get_prompt("create_comment"),
                 dry_run = dry_run,
                 **self.delays3,
             ) # Action 5+7 & Agent 2
@@ -626,7 +660,7 @@ class Farmer(BrowserController):
                 self.config.sub_counter("comment")
                 self.timer.start_timer("comment")
         else:
-            article = read_full_article(self.page, self.delays.action, verbose=verbose) # Action 5
+            article = read_full_article(**common, action_delay=self.delays.action) # Action 5
         self.config.sub_counter("read")
         article["written_comment"] = comment
 
@@ -645,7 +679,6 @@ class Farmer(BrowserController):
     def write_article(
             self,
             articles: list[ArticleInfo],
-            prompt: Callable,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             update: bool = True,
@@ -658,7 +691,7 @@ class Farmer(BrowserController):
                 my_articles = self.log.my_articles,
                 title_limit = (self.config.length["title"] or "30자 이내"),
                 contents_limit = (self.config.length["contents"] or "300자 이내"),
-                prompt = prompt("create_article"),
+                prompt = self.get_prompt("create_article"),
                 verbose = verbose,
                 dry_run = dry_run,
                 **self.delays3,
@@ -877,3 +910,14 @@ class Farmer(BrowserController):
             self.__vpn = None
             self.vpn_config = None
             self.vpn_enabled = False
+
+    def ensure_vpn_connected(self, ip_addr: str, max_vpn_retries: int = 5, vpn_delay: float = 5.) -> bool:
+        for step in range(1, max_vpn_retries+1):
+            try:
+                self.vpn.try_login(**self.vpn_config.login)
+                if self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect):
+                    return True
+            except Exception:
+                self.vpn.start_process(force_restart=True)
+                wait(vpn_delay * step)
+        raise VpnFailedError("VPN이 연결되지 않았습니다.")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from task.farm import Farmer, QuiteHours
+from task.farm import Farmer, MaxRetries, QuiteHours
 from extensions.gsheets import WorksheetConnection
 from extensions.vpn import VpnConfig
 from utils.common import Delay
@@ -37,10 +37,11 @@ class ReadConfig(TypedDict):
     like_threshold: float
 
 class RunConfig(TypedDict, total=False):
-    max_task_loop: int
-    max_action_loop: int
-    reload_start_step: int
+    max_retries: MaxRetries
     num_my_articles: int
+    max_read_length: int
+    reload_start_step: int
+    wait_until_read: bool
     task_delay: float
     vpn_delay: float
     with_state: bool

@@ -8,7 +8,7 @@ from core.agent import ArticleInfo, create_comment
 from core.agent import NewArticle, create_article
 
 from utils.common import print_json, wait, Delay
-from utils.locator import Overlay, locate_all
+from utils.locator import Overlay, locate, locate_all
 from utils.locator import is_visible, range_boundaries
 from utils.mouse import safe_wheel
 from utils.touchscreen import safe_tap
@@ -36,6 +36,7 @@ class Contents(TypedDict):
     lines: list[str]
     visible_lines: list[str]
     total_lines: int
+    word_count: int
     read_start: int
     read_end: int
     read_done: bool
@@ -122,29 +123,23 @@ def cafe_url(mobile: bool) -> str:
 ###################### Action 1 - :goto_cafe: #####################
 ###################################################################
 
-def goto_cafe(
-        page: Page,
-        cafe_name: str,
-        goto_delay: Delay = (1, 3),
-    ):
+def goto_cafe(page: Page, cafe_name: str, goto_delay: Delay = (1, 3)):
     """## Action 1"""
-    cafe_li = f'.mycafe_flicking:not([style="display: none;"]) a:has-text("{cafe_name}")'
-    if page.locator(cafe_li).count() > 0:
-        page.tap(cafe_li)
-        return wait(goto_delay)
+    try:
+        locate(page, 'a:has-text("내 카페")', nth=-1).tap()
+    except Exception:
+        page.goto("https://m.cafe.naver.com/ca-fe/home/cafes/join")
+    wait(goto_delay)
 
-    my_cafe = '.area_flick_view a:has-text("내 카페")'
-    if page.locator(my_cafe).count() > 0:
-        page.tap(my_cafe), wait(goto_delay)
-        cafe_li = f'.cafe_info:has-text("{cafe_name}")'
-        if page.locator(cafe_li).count() > 0:
-            ranges = dict(
-                boundary = page.locator("body").first,
-                overlay = dict(top=page.locator(".HeaderWrap").first.bounding_box()["height"]))
-            safe_tap(page, cafe_li, **ranges)
-            return wait(goto_delay)
+    try:
+        page.locator(cafe_link := f'.cafe_info:has-text("{cafe_name}")').first
+    except Exception:
+        raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
 
-    raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
+    ranges = dict(
+        boundary = page.locator("body").first,
+        overlay = dict(top=page.locator(".HeaderWrap").first.bounding_box()["height"]))
+    safe_tap(page, cafe_link, **ranges), wait(goto_delay)
 
 
 def go_back(page: Page, goto_delay: Delay = (1, 3)):
@@ -286,7 +281,8 @@ def read_article(
     ) -> ArticleInfo | Contents:
     """## Action 5"""
     lines, visible_lines = list(), list()
-    isin_viewport, read_start, read_end = False, 0, 0
+    isin_viewport = False
+    word_count, read_start, read_end = 0, 0, 0
     _, min_y, _, max_y = range_boundaries(page, **get_cafe_ranges(page, header=True, tab=False))
 
     selector = lambda tag: f'#postContent {tag}:not([style="display: none;"]):not(.se-module-oglink *)'
@@ -296,6 +292,7 @@ def read_article(
             line = f"![{el.get_attribute('alt') or '이미지'}]({el.get_attribute('src')})"
         else:
             line = el.text_content().replace('\u200b', '').strip()
+            word_count += len(line)
         lines.append(line)
 
         if is_visible(el, min_y, max_y):
@@ -318,8 +315,8 @@ def read_article(
         wait(max(seconds, 0.1))
 
     if contents_only:
-        keys = ["lines", "visible_lines", "total_lines", "read_start", "read_end", "read_done"]
-        values = [lines, visible_lines, total_lines, read_start, read_end, read_done]
+        keys = ["lines", "visible_lines", "total_lines", "word_count", "read_start", "read_end", "read_done"]
+        values = [lines, visible_lines, total_lines, word_count, read_start, read_end, read_done]
         return dict(zip(keys, values))
     else:
         return _make_article_info(page, lines)

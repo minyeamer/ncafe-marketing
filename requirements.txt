@@ -1,5 +1,8 @@
+PyYAML>=6.0.3
+
 playwright==1.56.0
 requests>=2.32.4
+
 gspread>=6.2.1
-tqdm>=4.67.1
-PyYAML>=6.0.3
+openai==2.15.0
+pywinauto==0.6.9

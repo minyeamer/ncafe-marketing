@@ -73,7 +73,7 @@ def locate(
             visible = [element for element in locator.all() if is_visible(element, min_y, max_y, threshold)]
             return random.choice(visible) if nth == "random" else visible[nth]
         elif isinstance(nth, int):
-            return locator.all()[nth] if nth > 0 else element
+            return locator.all()[nth] if nth != 0 else element
         elif nth == "random":
             return random.choice(locator.all())
         else:
